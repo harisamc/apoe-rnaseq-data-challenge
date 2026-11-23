@@ -1,0 +1,2831 @@
+---
+title: 'APOE RNA-seq Data Challenge'
+author: "Harisa Muratovic-Colic"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+params:
+  run_kegg: true
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+subtitle: APOE Genotype and Induced Ageing in Human Brain Organoids
+---
+
+\newpage
+# Data challenge workflow diagram
+
+```{=latex}
+\begin{center}
+\includegraphics[ 
+  width=\textwidth,
+  keepaspectratio
+]{assets/workflow.pdf}
+\end{center}
+```
+
+\newpage
+# Main Analysis
+
+## Introduction
+
+The data challenge is focused on answering how the respective APOE genotype and induced ageing affect the transcriptional state of the organoids.
+
+**About the provided data:**
+
+- _counts.tsv_ file (gene-level counts generated from STAR-aligned BAM files using GENCODE v49 annotation);
+- metadata (sample and replicate information; genotype, age inducing treatment duration, and harvest day);
+- MultiQC report. 
+
+**About the experimental design:** 
+
+The APOE4 line is the parental donor line and the APOE3 line is a CRISPR-edited isogenic line from the same donor. The three replicates are separate biological replicates of the same respective cell line. Ageing was induced with inhibition of neddylation for 10 and 20 days (Saurat et al., 2024).
+
+**About confounding:** 
+
+The 10-day ageing samples were harvested at day 70, whereas the 0-day and 20-day samples were harvested at day 80 reflecting partial confounding. The strongest ageing comparison is 20 days vs 0 days, with both cultures having been harvested on day 80. The analysis is therefore mostly focused on this comparison. 
+
+**About the software:** 
+
+The original analysis used R 4.3.2. This revision preserves its primary DESeq2 design and contrasts. Session information for this render is recorded at the end. 
+
+*R code is hidden from the main report for readability. Figures and selected analysis outputs include links to the corresponding code in the [Appendix](#appendix-r-code).*
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(DESeq2)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(edgeR)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(genefilter)
+library(ashr)
+library(ggrepel)
+library(patchwork)
+
+
+# Load count matrix and metadata
+countMatrix <- read.delim("data/counts.tsv", row.names = 1, check.names = FALSE)
+#summary(countMatrix)
+metadata <- read.csv("data/RNAseq_challenge_metadata.csv")
+# Are the samples in the same order?
+stopifnot(!anyDuplicated(metadata$sample), !anyDuplicated(colnames(countMatrix)),
+          setequal(metadata$sample, colnames(countMatrix)))
+countMatrix <- countMatrix[, metadata$sample, drop = FALSE]
+# Assign sample names to rows
+rownames(metadata) <- metadata[, 1]
+```
+
+## Sequencing and alignment QC
+
+The clarification received from the challenge team was that these were ribo-depleted total-RNA libraries. Salmon quantified against the GENCODE v49 annotated transcriptome. STAR aligned against the genome, and the supplied gene counts were derived from those genomic alignments. Reads from intronic or unannotated regions can contribute to genome alignment while falling outside the Salmon transcript reference.
+
+```{r multiqc-table, echo=TRUE}
+multiqc <- xml2::read_html("data/multiqc_report.html")
+general_stats <- xml2::xml_find_first(multiqc, "//table[@id='general_stats_table']")
+get_metric <- function(key) {
+  cells <- xml2::xml_find_all(general_stats, sprintf(".//td[contains(@class, '%s')]", key))
+  rows <- xml2::xml_find_all(general_stats, ".//tbody/tr")
+  labels <- xml2::xml_text(xml2::xml_find_first(rows, "./th"), trim = TRUE)
+  values <- suppressWarnings(as.numeric(sub("%$", "", xml2::xml_text(cells, trim = TRUE))))
+  stopifnot(length(values) == length(labels))
+  keep <- is.finite(values)
+  setNames(values[keep], sub("\\.pe$", "", labels[keep]))[metadata$sample]
+}
+qc_summary <- data.frame(
+  Sample = metadata$sample,
+  STAR = unname(get_metric("star-uniquely_mapped_percent")),
+  Salmon = unname(get_metric("salmon-percent_mapped")),
+  Q30 = unname(get_metric("fastp-after_filtering_q30_rate")),
+  Duplication = unname(get_metric("fastp-pct_duplication"))
+)
+stopifnot(all(complete.cases(qc_summary)))
+knitr::kable(qc_summary, digits = 1,
+             col.names = c("Sample", "STAR unique (%)", "Salmon mapped (%)",
+                           "fastp Q30 (%)", "fastp duplication (%)"))
+```
+
+All 18 libraries were retained based on consistently high post-filtering base quality, comparable gene-assigned depth, and within-group expression agreement. APOE4 AGED20D had 64.9–65.1% STAR unique mapping versus 74.3–76.8% in APOE4 controls. The MultiQC STAR breakdown attributed most of the difference to alignments classified as “unmapped: too short”, meaning their aligned length did not meet STAR criteria. This pattern was shared by all three APOE4 AGED20D libraries. A technical contribution to the group contrast remains possible, while the available QC does not isolate a failed library.
+
+## Count matrix QC
+
+### Library size
+
+```{r library-size, fig.width=6, fig.height=5, out.width="60%", fig.align="center"}
+library_sizes <- colSums(countMatrix)
+
+#summary(library_sizes/1e6)
+
+plot_df <- metadata
+plot_df$library_size_m <- colSums(countMatrix)[plot_df$sample] / 1e6
+plot_df$group <- paste(
+  plot_df$genotype,
+  plot_df$ageing_treatment_days,
+  sep = "_"
+)
+
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = rev(plot_df$sample)
+)
+
+ggplot(
+  plot_df,
+  aes(
+    x = sample,
+    y = library_size_m,
+    fill = group
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Library size per sample",
+    x = NULL,
+    y = "Total counts (millions)",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+*[View R code in the Appendix](#code-library-size)*
+
+The total number of gene-assigned counts is similar across samples, with no obvious library-size outlier.
+
+
+
+
+```{r experimental-design}
+metadata$ageing_treatment_days <- factor(
+  metadata$ageing_treatment_days,
+  levels = c("0", "10", "20")
+)
+
+metadata$genotype <- factor(
+  metadata$genotype,
+  levels = c("APOE3", "APOE4")
+)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = countMatrix,
+  colData = metadata,
+  design = ~ genotype * ageing_treatment_days
+)
+
+#model.matrix(
+#  ~ genotype * ageing_treatment_days,
+#  data = metadata
+#)
+```
+
+
+### Filter genes with few counts
+
+Genes are retained when they have at least 10 counts in at least 3 samples, as recommended in the DESeq2 documentation (Love et al., 2014).
+```{r gene-filtering}
+cat("The number of genes prior to filtering is", nrow(dds))
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep, ]
+cat("The number of genes after filtering is", nrow(dds))
+```
+
+
+## Normalization and transformation for exploratory analysis
+
+Normalization of the count matrix is done with the variance stabilizing transformation (vst) for exploratory purposes. Differential expression is performed later with the R package DESeq2 (v.1.42.1) using the raw counts stored in `dds`.
+
+```{r transformations}
+vsd <- vst(dds, blind = FALSE)
+#head(assay(vsd), 3)
+```
+
+### Sample similarity and replicate variability
+
+Overall sample similarity including replicates was assessed using hierarchical clustering based on Euclidean distances between vst-transformed expression profiles. Pearson correlation coefficients were additionally calculated to quantify replicate similarities more directly. Biological replicates within the same experimental groups showed high similarity supporting replicate consistency. 
+
+### Sample distance heatmap (Euclidean distance)
+```{r sample-distance, fig.width=6, fig.height=5, out.width="60%", fig.align="center"}
+sampleDists <- dist(t(assay(vsd)))
+
+sampleDistMatrix <- as.matrix(sampleDists)
+
+colors <- colorRampPalette(
+  rev(brewer.pal(9, "Oranges"))
+)(255)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  col = colors
+)
+
+```
+
+*[View R code in the Appendix](#code-sample-distance)*
+
+
+### Sample correlation (Pearson's correlation coefficient)
+
+Correlation analysis revealed high similarity between the replicates. The coefficients are presented below.
+```{r sample-corr}
+# Pearson correlation between samples
+sampleCor <- cor(
+  assay(vsd),
+  method = "pearson"
+)
+
+#pheatmap(
+#  sampleCor,
+#  clustering_distance_rows = "correlation",
+#  clustering_distance_cols = "correlation",
+#  main = "Pearson correlation between samples"
+#)
+
+# Show correlation matrix
+#round(sampleCor, 3)
+
+#sampleCor[
+#  c("APOE3_AGED10D_1", "APOE3_AGED10D_2", "APOE3_AGED10D_3"),
+#  c("APOE3_AGED10D_1", "APOE3_AGED10D_2", "APOE3_AGED10D_3")
+#]
+
+# Create table for printing
+sample_cor_table <- data.frame(
+  Sample = c(
+    "APOE3_CTRL",
+    "APOE3_AGED10",
+    "APOE3_AGED20",
+    "APOE4_CTRL",
+    "APOE4_AGED10",
+    "APOE4_AGED20"
+  ),
+  `Correlation Range` = c(
+    "0.9954–0.9983",
+    "0.9895–0.9973",
+    "0.9961–0.9979",
+    "0.9934–0.9971",
+    "0.9933–0.9974",
+    "0.9963–0.9983"
+  )
+)
+
+knitr::kable(
+  sample_cor_table,
+  caption = "Pearson correlation ranges between biological replicates."
+)
+
+```
+
+*[View R code in the Appendix](#code-sample-corr)*
+
+
+### Principal component analysis (PCA)
+
+As an additional sample-level quality assessment, PCA was performed on the vst-transformed expression. PCA summarizes the major sources of variation across samples and allows assessment of both replicate consistency and separation between experimental groups. PC1, explaining 43% of the variance, shows separation of control samples from samples subjected to induced ageing. PC2, explaining 40% of the variance, shows a clear separation between APOE3 and APOE4. Overall, the replicates cluster closely within their respective experimental groups.
+
+```{r pca, fig.width=7.5, fig.height=5, out.width="60%", fig.align="center"}
+pca_df <- plotPCA(
+  vsd,
+  intgroup = c("genotype", "ageing_treatment_days"),
+  ntop = 500,
+  returnData = TRUE
+)
+
+percentVar <- round(
+  100 * attr(pca_df, "percentVar")
+)
+
+ggplot(
+  pca_df,
+  aes(
+    PC1,
+    PC2,
+    color = genotype,
+    shape = ageing_treatment_days
+  )
+) +
+  geom_point(size = 4) +
+  labs(
+    title = "PCA of VST-transformed gene expression",
+    x = paste0("PC1 (", percentVar[1], "%)"),
+    y = paste0("PC2 (", percentVar[2], "%)"),
+    color = "APOE genotype",
+    shape = "Ageing treatment (days)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+*[View R code in the Appendix](#code-pca)*
+
+\newpage
+**Note about batch effects:** No information on technical processing batches, sequencing runs, processing dates, or other potential batch variables was provided in the metadata. Therefore, no batch covariate was included in the design formula. Above shown exploratory analyses did not reveal an obvious additional source of variation between the replicates. However, the replicate of APOE3 with age inducing for 10 days (replicate 1) deviated slightly from the remaining two replicates in the PCA and heatmap plots. Nevertheless, Pearson correlations between those three replicates remained very high (_r_ = 0.989–0.997), supporting overall replicate consistency. 
+
+## Differential expression analysis
+
+The analysis was conducted with DESeq2. The design formula is specified as `~ genotype * ageing_treatment_days`, which models the main effects of APOE genotype and induced ageing as well as their interaction. APOE3 at 0 days of induced ageing are used as the reference levels (APOE3_CTRL). The model estimates baseline genotype differences, ageing effects, and genotype-specific ageing responses (interaction). Throughout the text, these will refered to as contrasts.
+
+The interaction term tests whether the transcriptional response to ageing differs between APOE4 and APOE3 organoids. As mentioned, because the 10-day samples were harvested at day 70, while the 0-day and 20-day samples were harvested at day 80, the main ageing analyses focus on the 20-day vs 0-day comparison. Genes were considered significantly differentially expressed for downstream analysis when the adjusted p-value was below 0.05 and the absolute log2 fold change (|LFC|) was above 1. Multiple-hypothesis testing correction was performed using the Benjamini–Hochberg method as implemented in DESeq2.
+The contrasts include the following:
+```{r deseq2-model, message=FALSE}
+dds <- DESeq(dds)
+#resultsNames(dds)
+```
+
+- Contrast 1: APOE4 vs APOE3 at baseline
+
+```{r contrast-genotype, message = FALSE}
+res_genotype_CTRL <- results(
+  dds,
+  name = "genotype_APOE4_vs_APOE3",
+  alpha = 0.05
+)
+
+# Shrink LFC for stabilizing effect-size
+res_genotype_CTRL_shrunk <- lfcShrink(
+    dds,
+    coef = "genotype_APOE4_vs_APOE3",
+    type = "apeglm")
+
+#summary(res_genotype_CTRL)
+```
+*[View R code in the Appendix](#contrast-genotype)*
+
+- Contrast 2: 20-day ageing effect in APOE3
+
+
+```{r contrast-apoe3, message = FALSE}
+res_ageing_APOE3 <- results(
+  dds,
+  name = "ageing_treatment_days_20_vs_0",
+  alpha = 0.05
+)
+# Shrink LFC
+res_ageing_APOE3_shrunk <- lfcShrink(
+    dds,
+    coef = "ageing_treatment_days_20_vs_0",
+    type = "apeglm")
+
+#summary(res_ageing_APOE3)
+```
+*[View R code in the Appendix](#contrast-apoe3)*
+
+- Contrast 3: 20-day ageing effect in APOE4
+
+```{r contrast-apoe4, message = FALSE}
+res_ageing_APOE4 <- results(
+  dds,
+  contrast = list(
+    c(
+      "ageing_treatment_days_20_vs_0",
+      "genotypeAPOE4.ageing_treatment_days20"
+    )
+  ),
+  alpha = 0.05
+)
+
+# Use ashr for shrinkage instead of apeglm because of the specified APOE4 x ageing effect being a linear combination
+res_ageing_APOE4_shrunk <- lfcShrink(
+  dds,
+  res = res_ageing_APOE4,
+  type = "ashr"
+)
+
+#summary(res_ageing_APOE4)
+```
+*[View R code in the Appendix](#contrast-apoe4)*
+
+- Contrast 4: Genotype-by-ageing interaction
+
+```{r contrast-interaction, message = FALSE}
+# unshrunken results
+res_interaction_20 <- results(
+    dds,
+    name = "genotypeAPOE4.ageing_treatment_days20",
+    alpha = 0.05
+)
+
+# shrunken LFC
+res_interaction_20_shrunk <- lfcShrink(
+    dds,
+    coef = "genotypeAPOE4.ageing_treatment_days20",
+    type = "apeglm"
+)
+#summary(res_interaction_20)
+#summary(res_interaction_20_shrunk)
+```
+*[View R code in the Appendix](#contrast-interaction)*
+
+\newpage
+### MA plots
+
+MA plots visualize the LFC across the range of mean normalized gene expression for each contrast. Shrunken LFCs are shown below to provide more stable effect-size estimates and visualization, particularly for genes with low counts or high variability.
+
+```{r ma-plots, fig.width=7.5, fig.height=6.5, out.width="90%", fig.align="center"}
+# Define plot composition
+par(
+  mfrow = c(2, 2),
+  mar = c(4, 4, 3, 1),
+  mgp = c(2.5, 0.8, 0),
+  cex = 0.85
+)
+
+DESeq2::plotMA(
+  res_genotype_CTRL_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "APOE4 vs APOE3 (CTRL)"
+)
+
+DESeq2::plotMA(
+  res_ageing_APOE3_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "20d ageing vs CTRL (APOE3)"
+)
+
+DESeq2::plotMA(
+  res_ageing_APOE4_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "20d ageing vs CTRL (APOE4)"
+)
+
+DESeq2::plotMA(
+  res_interaction_20_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "Genotype × Ageing interaction"
+)
+
+par(mfrow = c(1, 1))
+```
+
+*[View R code in the Appendix](#code-ma-plots)*
+
+```{r shrunk vs unshrunk LFC, echo=FALSE}
+lfc_compare <- data.frame(
+  unshrunk = res_interaction_20$log2FoldChange,
+  shrunk   = res_interaction_20_shrunk$log2FoldChange
+)
+
+#head(lfc_compare)
+
+#summary(abs(lfc_compare$unshrunk - lfc_compare$shrunk))
+#lfc_compare$diff <- abs(
+#  lfc_compare$unshrunk - lfc_compare$shrunk
+#)
+
+# Total number of genes
+#nrow(lfc_compare)
+
+# Difference > 0.5 log2FC
+#sum(lfc_compare$diff > 0.5, na.rm = TRUE)
+
+# Difference > 1 log2FC
+#sum(lfc_compare$diff > 1, na.rm = TRUE)
+# There are 4200 genes whose LFC after shrinkage was differing by 0.5, 
+#and 1260 genes whose LFC after shrinkage differed by 1260. 
+# The analysis proceeds working with unshrunk LFCs.
+```
+
+
+
+
+To highlight one representative interaction effect, the gene with the lowest adjusted p-value in the `genotype × ageing` interaction was identified and marked on the MA plot below. The most significant interaction gene was `ENSG00000183395.5`, corresponding to the pro-melanin-concentrating hormone (PMCH). PMCH is highly expressed in brain tissue, is associated with chemical synaptic transmission and neuropeptide signalling (GeneCards, 2026) and will be addressed further in the following text. 
+```{r top-interaction-gene, fig.height=4, fig.width=6, out.width="60%", fig.align="center"}
+DESeq2::plotMA(
+  res_interaction_20_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "Genotype × Ageing interaction"
+)
+
+# Choose most significant gene based on the original Wald-test results
+topGene <- rownames(res_interaction_20)[
+  which.min(res_interaction_20$padj)
+]
+
+with(res_interaction_20_shrunk[topGene, ], {
+  points(
+    baseMean,
+    log2FoldChange,
+    col = "red",
+    pch = 1,
+    cex = 2.5,
+    lwd = 2
+  )
+
+  text(
+    baseMean,
+    log2FoldChange,
+    topGene,
+    pos = 2,
+    col = "red"
+  )
+})
+
+```
+
+*[View R code in the Appendix](#code-top-interaction-gene)*
+
+
+## Gene annotation
+
+
+Gene-level differential expression results were annotated using the `org.Hs.eg.db` R annotation package (v.3.18.0). Version suffixes were removed from the Ensembl gene identifiers, which were then mapped to HUGO Gene Nomenclature Committee (HGNC) gene symbols. For identifiers with multiple possible mappings, the first available gene symbol was retained.
+
+```{r gene-annotation, warning=FALSE, message=FALSE}
+# Function to annotate the DEA results
+# With kegg procedure, don't need this mapping, but the one with entrezid
+annotate_results <- function(res) {
+  df <- as.data.frame(res)
+  df$gene_id <- rownames(df)
+  df$ENSEMBL <- sub(
+    "\\..*$",
+    "",
+    rownames(df)
+  )
+  df$symbol <- mapIds(
+    org.Hs.eg.db,
+    keys = df$ENSEMBL,
+    keytype = "ENSEMBL",
+    column = "SYMBOL",
+    multiVals = "first"
+  )
+  df
+}
+# Function call
+genotype_df <- annotate_results(res_genotype_CTRL)
+apoe3_df <- annotate_results(res_ageing_APOE3)
+apoe4_df <- annotate_results(res_ageing_APOE4)
+interaction_df <- annotate_results(res_interaction_20)
+```
+
+
+```{r significant-genes}
+sig_interaction <- interaction_df[
+  !is.na(interaction_df$padj) &
+    interaction_df$padj < 0.05 &
+    abs(interaction_df$log2FoldChange) > 1,
+]
+
+#nrow(sig_interaction)
+```
+
+## Volcano plots of significantly differentially expressed genes
+
+
+
+
+```{r volcano-data}
+# Function to create volcano dataframes for plotting
+make_volcano_df <- function(df, comparison) {
+
+  df$comparison <- comparison
+
+  df$status <- "Not significant"
+
+  df$status[
+    !is.na(df$padj) &
+      df$padj < 0.05 &
+      df$log2FoldChange > 1
+  ] <- "Positive LFC"
+
+  df$status[
+    !is.na(df$padj) &
+      df$padj < 0.05 &
+      df$log2FoldChange < -1
+  ] <- "Negative LFC"
+
+  df$label <- ifelse(
+    is.na(df$symbol),
+    df$ENSEMBL,
+    df$symbol
+  )
+
+  df
+}
+
+# Function call
+volcano_df <- bind_rows(
+  make_volcano_df(
+    genotype_df,
+    "APOE4 vs APOE3 (CTRL)"
+  ),
+  make_volcano_df(
+    apoe3_df,
+    "20d ageing vs CTRL (APOE3)"
+  ),
+  make_volcano_df(
+    apoe4_df,
+    "20d ageing vs CTRL (APOE4)"
+  ),
+  make_volcano_df(
+    interaction_df,
+    "Genotype × Ageing interaction"
+  )
+)
+
+volcano_df$comparison <- factor(
+  volcano_df$comparison,
+  levels = c(
+    "APOE4 vs APOE3 (CTRL)",
+    "20d ageing vs CTRL (APOE3)",
+    "20d ageing vs CTRL (APOE4)",
+    "Genotype × Ageing interaction"
+  )
+)
+
+# Label top 3 genes determined by the lowest padj value
+top3 <- volcano_df %>%
+  filter(status != "Not significant") %>%
+  group_by(comparison, status) %>%
+  slice_min(
+    order_by = padj,
+    n = 3,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+```
+
+```{r volcano-plot, fig.width=11, fig.height=8, fig.align="center", out.width="90%"}
+# Volcano plots
+ggplot(
+  volcano_df,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = status
+  )
+) +
+  geom_point(
+    alpha = 0.5,
+    size = 0.8
+  ) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    data = top3,
+    aes(label = label),
+    size = 3,
+    box.padding = 0.4,
+    point.padding = 0.2,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  facet_wrap(
+    ~ comparison,
+    ncol = 2
+  ) +
+  labs(
+    title = "Differential gene expression",
+    x = "log2 fold change",
+    y = "-log10 adjusted p-value",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 16),
+    strip.text = element_text(size = 11),
+    legend.text = element_text(size = 10)
+)
+```
+
+*[View R code in the Appendix](#code-volcano-analysis)*
+
+Volcano plots show the magnitude and statistical significance of differential expression across the four contrasts. Positive and negative LFCs indicate the direction of the expression change according to the respective contrast. The top three significant genes are labelled in the plots for each contrast and direction.
+
+The first plot (APOE4 vs APOE3 (CTRL)) shows differences between the genotypes at baseline. APOE4 showed lower expression relative to APOE3 for PMCH, NKX2-4, and ENSG00000269993. These genes are associated with neuroendocrine/developmental regulation, synaptic transmission as well as a lncRNA locus. Higher expression in APOE4 was observed for several zinc-finger-associated transcriptional regulators, including ZNF585B, ZNF280D, and ZNF252P. ZNF585B and ZNF280D are involved in transcriptional regulation, while ZNF252P is annotated here as a pseudogene. Manual functional inspection of `ENSG00000269993` and ZNF252P revealed them as lncRNAs (GeneCards, 2026; Qu et al., 2025). 
+
+The second plot (20d ageing vs CTRL (APOE3)) corresponds to the transcriptional response of the APOE3 genotype after 20 days of induced ageing. Lower expression was observed for several histone-encoding genes, including H1-4, H4C14, and H4C15, suggesting changes related to chromatin organization. Increased expression was observed for SEMA3E, LDB2, and GLRA3. These genes are broadly associated with neuronal development, neuronal signalling, and transcriptional regulation. SEMA3E is involved in axon guidance, GLRA3 contributes to inhibitory neurotransmission, and LDB2 is involved in transcriptional regulation. Overall, the APOE3 ageing response therefore appears to include downregulation of histone-associated genes together with increased expression of genes involved in neuronal signalling and developmental or transcriptional regulation.
+
+\newpage
+The third plot (20d ageing vs CTRL (APOE4)) corresponds to the transcriptional response of the APOE4 genotype after 20 days of induced ageing. Lower expression was observed for functionally diverse genes including CFAP46, involved in ciliary structure and function; H1-4, which was also decreased in the APOE3 ageing response; and ZNF512B, a transcriptional regulator. Increased expression was observed for BCL6, FBXO32, and SLC4A7, which are involved in different aspects of cellular regulation and homeostasis, including transcriptional and inflammatory regulation, protein turnover, and ion/pH transport. These results suggest that the APOE4 ageing response involves changes across several cellular regulatory and homeostatic processes rather than one dominant functional group.
+
+In the final volcano plot (Genotype × Ageing interaction), the `genotype × ageing` interaction identifies genes for which the transcriptional response to 20 days of induced ageing differs between APOE4 and APOE3. Positive LFCs indicate a more positive ageing response in APOE4 relative to APOE3, whereas negative LFCs indicate a more negative ageing response in APOE4. Negative interaction LFCs were observed for GRM5, FBN3, and CADM3, which are associated with neuronal signalling, cell adhesion, and extracellular matrix structure. Positive interaction LFCs were observed for DUSP1, GABRQ, and PMCH, representing genes involved in MAPK/stress-response signalling and neuroendocrine signalling. PMCH is particularly notable because it showed lower expression in APOE4 than in APOE3 at baseline, while its positive interaction LFC indicates that its ageing response was more positive in APOE4 than in APOE3. It was therefore highlighted in both the MA and volcano plots of the interaction contrast.
+
+
+## KEGG pathway enrichment analysis
+
+```{r kegg-render-mode, results='asis'}
+if (!params$run_kegg) {
+  cat("*Offline render. The KEGG narrative below describes the original submission. Live enrichment and its plots were skipped in this render.*\n\n")
+}
+```
+
+KEGG pathway enrichment analysis was performed to identify pathways overrepresented among significantly differentially expressed genes (adjusted p-value < 0.05 and |LFC| > 1). Positive- and negative-LFC gene sets were analyzed separately to preserve the direction of the transcriptional response.
+
+Because `clusterProfiler::enrichKEGG` uses Entrez gene identifiers, Ensembl IDs were converted to Entrez IDs before enrichment. Genes without an Entrez mapping were therefore excluded. All genes retained in the DESeq2 analysis that could be mapped to Entrez IDs were used as the enrichment background. Enrichment was tested using Benjamini-Hochberg correction for multiple testing. 
+
+```{r kegg-background, eval=params$run_kegg, warning=FALSE, message=FALSE}
+# Function to map ensembl IDs to entrez IDs
+to_entrez <- function(genes) {
+  suppressWarnings(
+    suppressMessages(
+      bitr(
+        genes,
+        fromType = "ENSEMBL",
+        toType = "ENTREZID",
+        OrgDb = org.Hs.eg.db
+      )
+    )
+  ) |>
+    pull(ENTREZID) |>
+    unique()
+}
+
+# Background: all genes retained in the DESeq2 analysis
+background_genes <- unique(
+  sub(
+    "\\..*$",
+    "",
+    rownames(dds)
+  )
+)
+
+background_entrez <- to_entrez(background_genes)
+```
+
+
+
+```{r apoe3-kegg-genes, eval=params$run_kegg, warning=FALSE, message=FALSE}
+### APOE3 ageing response
+# Genes with increased expression after 20d ageing in APOE3
+apoe3_up <- unique(
+  apoe3_df$ENSEMBL[
+    !is.na(apoe3_df$padj) &
+      apoe3_df$padj < 0.05 &
+      apoe3_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with decreased expression after 20d ageing in APOE3
+apoe3_down <- unique(
+  apoe3_df$ENSEMBL[
+    !is.na(apoe3_df$padj) &
+      apoe3_df$padj < 0.05 &
+      apoe3_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+apoe3_up_entrez <- to_entrez(apoe3_up)
+apoe3_down_entrez <- to_entrez(apoe3_down)
+
+# Run KEGG analysis
+kegg_APOE3_up <- enrichKEGG(
+  gene = apoe3_up_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_APOE3_down <- enrichKEGG(
+  gene = apoe3_down_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# Plot APOE3 KEGG results
+p1 <- dotplot(
+  kegg_APOE3_up,
+  showCategory = 10
+) +
+  ggtitle("APOE3: KEGG pathways increased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p2 <- dotplot(
+  kegg_APOE3_down,
+  showCategory = 10
+) +
+  ggtitle("APOE3: KEGG pathways decreased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+
+
+```{r apoe4-kegg-genes, eval=params$run_kegg, warning=FALSE, message=FALSE}
+### APOE4 ageing response
+# Genes with increased expression after 20d ageing in APOE4
+apoe4_up <- unique(
+  apoe4_df$ENSEMBL[
+    !is.na(apoe4_df$padj) &
+      apoe4_df$padj < 0.05 &
+      apoe4_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with decreased expression after 20d ageing in APOE4
+apoe4_down <- unique(
+  apoe4_df$ENSEMBL[
+    !is.na(apoe4_df$padj) &
+      apoe4_df$padj < 0.05 &
+      apoe4_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+apoe4_up_entrez <- to_entrez(apoe4_up)
+apoe4_down_entrez <- to_entrez(apoe4_down)
+
+# APOE4 KEGG
+kegg_APOE4_up <- enrichKEGG(
+  gene = apoe4_up_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_APOE4_down <- enrichKEGG(
+  gene = apoe4_down_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# Plot APOE4 KEGG results
+p3 <- dotplot(
+  kegg_APOE4_up,
+  showCategory = 10
+) +
+  ggtitle("APOE4: KEGG pathways increased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p4 <- dotplot(
+  kegg_APOE4_down,
+  showCategory = 10
+) +
+  ggtitle("APOE4: KEGG pathways decreased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+### Enriched pathways dot plots
+
+```{r interaction-kegg, eval=params$run_kegg, warning=FALSE, message=FALSE}
+### Genotype-by-ageing interaction
+# Genes with a higher/more positive ageing response in APOE4 than APOE3
+
+interaction_higher_ensembl <- unique(
+  interaction_df$ENSEMBL[
+    !is.na(interaction_df$padj) &
+      interaction_df$padj < 0.05 &
+      interaction_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with a lower/more negative ageing response in APOE4 than APOE3
+interaction_lower_ensembl <- unique(
+  interaction_df$ENSEMBL[
+    !is.na(interaction_df$padj) &
+      interaction_df$padj < 0.05 &
+      interaction_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+interaction_higher_entrez <- to_entrez(interaction_higher_ensembl)
+interaction_lower_entrez <- to_entrez(interaction_lower_ensembl)
+
+# genotype * treatment KEGG
+kegg_interaction_higher <- enrichKEGG(
+  gene = interaction_higher_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_interaction_lower <- enrichKEGG(
+  gene = interaction_lower_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# genotype * treatment plot
+p5 <- dotplot(
+  kegg_interaction_higher,
+  showCategory = 10
+) +
+  ggtitle("Interaction: higher ageing response in APOE4") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p6 <- dotplot(
+  kegg_interaction_lower,
+  showCategory = 10
+) +
+  ggtitle("Interaction: lower ageing response in APOE4") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+```{r joined-kegg-dotplots, eval=params$run_kegg, fig.width=14, fig.height=18, out.width="100%", fig.align="center", warning=FALSE, message=FALSE}
+
+# Plot the six KEGG enrichment results together
+p1 <- p1 + theme(plot.margin = margin(10, 10, 30, 10))
+p2 <- p2 + theme(plot.margin = margin(10, 10, 30, 10))
+p3 <- p3 + theme(plot.margin = margin(10, 10, 30, 10))
+p4 <- p4 + theme(plot.margin = margin(10, 10, 30, 10))
+p5 <- p5 + theme(plot.margin = margin(10, 10, 10, 10))
+p6 <- p6 + theme(plot.margin = margin(10, 10, 10, 10))
+
+combined_kegg <-
+  (p1 | p2) /
+  (p3 | p4) /
+  (p5 | p6)
+combined_kegg
+```
+*[View R code in the Appendix](#code-pathway-enrichment)*
+
+\newpage
+
+Enriched pathways in the dot plots indicate that genes belonging to a respective KEGG pathway occur more frequently among the significantly differentially expressed genes than would be expected by chance, given the background set of genes included in the analysis. Therefore, enrichment reflects an over-representation of differentially expressed genes that are associated with a pathway, rather than an absolute activation or inhibition of the specific pathway. 
+
+Among genes upregulated after 20 days of induced ageing treatment (plots APOE3: KEGG pathways increased after 20d ageing and APOE4: KEGG pathways increased after 20d ageing), 6 of the 10 most strongly enriched pathways overlapped between APOE3 and APOE4 genotypes. These include neuroactive ligand–receptor interaction, cytoskeleton in muscle cells, ECM–receptor interaction, protein digestion and absorption, hematopoietic cell lineage, and _Staphylococcus aureus_ infection. The overlap suggests that part of the transcriptional response to induced ageing treatment is shared for both genotypes.
+
+Among genes downregulated after 20 days of induced ageing treatment (plots APOE3: KEGG pathways decreased after 20d ageing and APOE4: KEGG pathways decreased after 20d ageing), 4 of the 10 most strongly enriched pathways overlapped between APOE3 and APOE4: alcoholism, neutrophil extracellular trap formation, systemic lupus erythematosus, and viral carcinogenesis. These pathways include genes involved in immune and inflammatory processes. Their enrichment within the downregulated genes may therefore indicate a reduction in expression of genes involved in immune-related functions, as a response to induced ageing treatment.
+
+Analysis of the `genotype × induced-ageing` interaction identified pathways whose ageing-associated transcriptional response differed between APOE4 and APOE3 (plots Interaction: higher ageing response in APOE4 and Interaction: lower ageing response in APOE4). Pathways showing a higher ageing response in APOE4 relative to APOE3 included several cancer-related pathways. This indicates that genes assigned to these pathways showed a stronger positive ageing-associated expression change in APOE4 than in APOE3. Because KEGG cancer pathways contain many broadly acting genes involved in processes such as cell-cycle regulation, signalling, apoptosis, and proliferation, this result should not be interpreted as evidence of cancer-like pathology itself.
+
+A lower ageing response in APOE4 relative to APOE3 was observed for pathways including neuroactive ligand–receptor interaction, calcium signalling, olfactory transduction, serotonergic synapse, glutamatergic synapse, dilated cardiomyopathy, GABAergic synapse, ABC transporters, and nicotine addiction. In these pathways, the ageing-associated change in expression was lower in APOE4 than in APOE3. Several of these pathways share genes involved in neuronal receptors, ion channels, neurotransmitter signalling, and synaptic function, suggesting that the enrichment noted may reflect altered neuronal and synaptic transcriptional responses between the genotypes due to ageing treatment.
+
+_Note: Pathway enrichment should not be interpreted as direct activation or deactivation of an entire biological pathway. Similarly, enrichment of pathways such as nicotine addiction, alcoholism, S. aureus infection, systemic lupus erythematosus, or cancer does not indicate that these biological conditions are occurring in the organoids. For example, the nicotine-addiction pathway contains genes involved in neurotransmitter receptors and synaptic signalling; enrichment therefore indicates differential expression of genes participating in those molecular processes._
+
+
+
+Because the interaction enrichment identified cancer-related pathways among genes with a higher ageing response in APOE4 and neuronal signalling pathways among genes with a lower ageing response in APOE4, one representative pathway from each theme was selected for closer inspection. `Pathways in cancer` was selected from the higher-response enrichment, while `Neuroactive ligand-receptor interaction` was selected from the lower-response enrichment. For both pathways, the underlying genes and their genotype-specific LFC changes were examined to determine the expression patterns driving the interaction.
+\newpage
+
+```{r kegg-representative-pathways, eval=params$run_kegg, warning=FALSE, message=FALSE}
+# One row per gene symbol for the genotype-specific ageing contrasts (unique)
+apoe3_unique <- apoe3_df |>
+  filter(!is.na(symbol)) |>
+  arrange(padj) |>
+  distinct(symbol, .keep_all = TRUE)
+
+apoe4_unique <- apoe4_df |>
+  filter(!is.na(symbol)) |>
+  arrange(padj) |>
+  distinct(symbol, .keep_all = TRUE)
+
+# Extract entrez IDs belonging to the selected KEGG pathways
+cellcycle_entrez <- kegg_interaction_higher@result |>
+  filter(Description == "Pathways in cancer") |>
+  pull(geneID) |>
+  strsplit("/") |>
+  unlist()
+
+glutamate_entrez <- kegg_interaction_lower@result |>
+  filter(Description == "Neuroactive ligand-receptor interaction") |>
+  pull(geneID) |>
+  strsplit("/") |>
+  unlist()
+
+# Convert pathway entrez IDs to gene symbols
+entrez_to_symbol <- function(ids) {
+  suppressMessages(
+    mapIds(
+      org.Hs.eg.db,
+      keys = ids,
+      keytype = "ENTREZID",
+      column = "SYMBOL",
+      multiVals = "first"
+    )
+  ) |>
+    unname() |>
+    unique() |>
+    na.omit()
+}
+
+cellcycle_symbols <- entrez_to_symbol(cellcycle_entrez)
+glutamate_symbols <- entrez_to_symbol(glutamate_entrez)
+
+
+# Decompose the interaction by calculating the difference 
+# (APOE3- and APOE4-specific ageing effects) 
+# for 'pathways in cancer' genes driving the interaction enrichment
+
+cancer_pathway_changes <- inner_join(
+  apoe3_unique |>
+    select(symbol, APOE3_LFC = log2FoldChange),
+  apoe4_unique |>
+    select(symbol, APOE4_LFC = log2FoldChange),
+  by = "symbol"
+) |>
+  filter(symbol %in% cellcycle_symbols) |>
+  mutate(
+    interaction = APOE4_LFC - APOE3_LFC,
+    pattern = case_when(
+      APOE3_LFC < 0 & APOE4_LFC > 0 ~
+        "down in APOE3, up in APOE4",
+      APOE3_LFC < 0 & APOE4_LFC <= 0 &
+        APOE4_LFC > APOE3_LFC ~
+        "decreased in both, weaker in APOE4",
+      APOE3_LFC >= 0 & APOE4_LFC > APOE3_LFC ~
+        "increased more strongly in APOE4",
+      TRUE ~ "other"
+    )
+  ) |>
+  arrange(desc(interaction))
+
+
+# Decompose the interaction by calculating the difference 
+# (APOE3- and APOE4-specific ageing effects) 
+# for 'Neuroactive ligand-receptor interaction' genes driving the interaction enrichment
+
+ligand_receptor_interaction_changes <- inner_join(
+  apoe3_unique |>
+    select(symbol, APOE3_LFC = log2FoldChange),
+  apoe4_unique |>
+    select(symbol, APOE4_LFC = log2FoldChange),
+  by = "symbol"
+) |>
+  filter(symbol %in% glutamate_symbols) |>
+  mutate(
+    interaction = APOE4_LFC - APOE3_LFC,
+    pattern = case_when(
+      APOE3_LFC > 0 & APOE4_LFC < 0 ~
+        "up in APOE3, down in APOE4",
+      APOE3_LFC > 0 & APOE4_LFC >= 0 &
+        APOE4_LFC < APOE3_LFC ~
+        "increased in both, weaker in APOE4",
+      APOE3_LFC <= 0 & APOE4_LFC < APOE3_LFC ~
+        "decreased more strongly in APOE4",
+      TRUE ~ "other"
+    )
+  ) |>
+  arrange(interaction)
+
+#cat ("Summary of the cancer pathway changes in genotypes:\n")
+#table(cancer_pathway_changes$pattern)
+#cat ("Summary of the ligand-receptor interaction pathway changes in genotypes:\n")
+#table(ligand_receptor_interaction_changes$pattern)
+```
+For genes in the `Pathways in cancer` pathway (87 genes), the more positive ageing response in APOE4 was mainly driven by genes that decreased in APOE3 but increased in APOE4 (47 genes), together with genes that decreased in both genotypes but less strongly in APOE4 (21 genes) and genes that increased more strongly in APOE4 (19 genes). 
+
+For genes in the `Neuroactive ligand-receptor interaction` pathway (32 genes), the lower ageing response in APOE4 was predominantly driven by genes whose expression increased in APOE3 but decreased in APOE4 (22 genes). A smaller number of genes increased in both genotypes but more weakly in APOE4 (9 genes), while only one gene decreased more strongly in APOE4.
+
+
+*[View R code in the Appendix](#code-interaction-scatter)*
+
+
+```{r barplot-keg-interaction, eval=params$run_kegg, fig.width=15, fig.height=8, fig.align="center", out.width="100%"}
+
+# Count expression-pattern categories based on differences in LFC
+cancer_pattern_counts <- cancer_pathway_changes |>
+  count(pattern)
+
+ligand_receptor_pattern_counts <- ligand_receptor_interaction_changes |>
+  count(pattern)
+
+# Plot cell cycle genes
+p_cellcycle_bar <- ggplot(
+  cancer_pattern_counts,
+  aes(
+    x = reorder(pattern, n),
+    y = n
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(
+    breaks = seq(
+      0,
+      max(cancer_pattern_counts$n) + 10,
+      by = 10
+    )
+  ) +
+  labs(
+    title = "KEGG: Cancer pathways",
+    subtitle = "Higher ageing response in APOE4",
+    x = NULL,
+    y = "Number of genes"
+  ) +
+  theme_minimal(base_size = 17)
+
+
+# Plot synaptic genes
+p_synaptic_bar <- ggplot(
+  ligand_receptor_pattern_counts,
+  aes(
+    x = reorder(pattern, n),
+    y = n
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "KEGG: Neuroactive ligand-receptor interaction",
+    subtitle = "Lower ageing response in APOE4",
+    x = NULL,
+    y = "Number of genes"
+  ) +
+  theme_minimal(base_size = 17) 
+
+
+p_cellcycle_bar | p_synaptic_bar
+
+```
+
+*[View R code in the Appendix](#code-interaction-scatter)*
+
+
+## Conclusion & limitations
+
+Overall, the analysis identified both shared and genotype-specific transcriptional responses to induced ageing via neddylation inhibition. The `genotype × ageing` interaction showed a relatively higher ageing response in APOE4 for genes associated mainly with cell-cycle and intracellular signalling processes, whereas genes involved in neuronal, synaptic, and neurotransmitter signalling showed a relatively lower ageing response in APOE4. PMCH was particularly notable, showing a strong baseline genotype difference and the most statistically significant *genotype × ageing* interaction.
+
+A limitation of the analysis was the limited information available on experimental and technical factors, such as potential processing or sequencing batches. In addition, the 10-day ageing condition was not included in the main differential expression interpretation because these samples were harvested at day 70, whereas the control and 20-day ageing samples were harvested at day 80. This introduces culture age as a potential confounding factor. If the 10-day ageing treatment had instead been initiated at day 70 and all groups harvested at day 80, the 10-day condition could have been compared more directly with the other groups. This analysis therefore assumes that no substantial unaccounted batch effects are present and focuses on the non-confounded comparisons. A further limitation is that gene annotation relied mainly on a human gene annotation database (`org.Hs.eg.db`). 
+
+\newpage
+Not all Ensembl gene identifiers could be mapped to gene symbols, gene types, transcript identifiers, or Entrez IDs. A further limitation is that the pathway analysis was restricted to over-representation analysis using KEGG.  Other approaches, such as gene set enrichment analysis (GSEA), could provide complementary information.
+
+
+# Optional analysis: RNA 
+
+## ncRNA
+
+To explore non-coding RNA that might have contributed to the observed transcriptional changes, significant genes were annotated by gene type using the R package `org.Hs.eg.db`. Genes annotated as `ncRNA`, `snoRNA`, `snRNA`, or `scRNA` were considered. For the APOE3 ageing, APOE4 ageing, and genotype × ageing interaction contrasts, significantly differentially expressed non-coding genes were identified using the same thresholds as for the main differential-expression analysis (`padj < 0.05` and `|log2FC| > 1`). The numbers of significant genes were then summarized by RNA type. Comparison and can be consulted in the barplot below.
+
+
+```{r ncRNA, fig.height=5, fig.width=9, out.width="70%", fig.align="center", message=FALSE}
+# Extract gene types
+gene_types <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = interaction_df$ENSEMBL,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENETYPE")
+)
+
+# Annotate interaction results with gene type
+interaction_df <- interaction_df |>
+  left_join(
+    gene_types |>
+      distinct(ENSEMBL, .keep_all = TRUE),
+    by = "ENSEMBL"
+  )
+
+#sort(
+#  table(interaction_df$GENETYPE, useNA = "ifany"),
+#  decreasing = TRUE
+#)
+
+# Define non coding RNAs
+nc_types <- c(
+  "ncRNA",
+  "snoRNA",
+  "snRNA",
+  "scRNA"
+)
+
+# Subset significant interaction genes annotated as non-coding RNA
+sig_interaction_nc <- interaction_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+cat("RNA biotypes among significant day-80 interaction genes:\n")
+table(sig_interaction_nc$GENETYPE)
+
+# Display the 20 most significant non-coding RNA interaction genes
+#sig_interaction_nc |>
+#  arrange(padj) |>
+#  select(
+#    ENSEMBL,
+#    symbol,
+#    GENETYPE,
+#    log2FoldChange,
+#    padj
+#  ) |>
+#  head(20)
+
+# Annotate ageing contrasts with gene type
+apoe3_df <- apoe3_df |>
+  left_join(gene_types |> distinct(ENSEMBL, .keep_all = TRUE),
+            by = "ENSEMBL")
+
+apoe4_df <- apoe4_df |>
+  left_join(gene_types |> distinct(ENSEMBL, .keep_all = TRUE),
+            by = "ENSEMBL")
+
+# Subset significant interaction genes annotated as non-coding RNA
+sig_apoe3_nc <- apoe3_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+sig_apoe4_nc <- apoe4_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+# Summarize significant non-coding RNA genes by comparison and gene type
+nc_summary <- bind_rows(
+  apoe3_df |>
+    mutate(comparison = "APOE3: 20d vs CTRL"),
+  apoe4_df |>
+    mutate(comparison = "APOE4: 20d vs CTRL"),
+  interaction_df |>
+    mutate(comparison = "Genotype × ageing interaction")
+) |>
+  filter(
+    GENETYPE %in% nc_types,
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1
+  ) |>
+  count(comparison, GENETYPE)
+
+
+# Plot the significant ncRNA genes
+ggplot(
+  nc_summary,
+  aes(
+    x = GENETYPE,
+    y = n,
+    fill = comparison
+  )
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Significant non-coding RNAs",
+    x = "RNA type",
+    y = "Number of significant genes",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 17)
+
+```
+
+*[View R code in the Appendix](#code-ncrna-analysis)*
+
+Significantly differentially expressed ncRNAs were observed across all three ageing-related contrasts. The majority belonged to the broad ncRNA category, with slightly more significant ncRNA genes observed in APOE4 20-day ageing relative to APOE3 20-day ageing. A substantial number of ncRNA genes also showed significant `genotype × ageing` interactions, indicating genotype-dependent 20-day ageing responses among non-coding transcripts. In comparison, relatively few snoRNA, snRNA and scRNA genes were significantly affected. 
+
+\newpage
+## Replicate-level non-coding RNA responses
+
+The plot uses the original DESeq2 fit and its size-factor-normalized counts. The illustrated loci were selected after inspecting the results to show different interaction patterns.
+
+```{r ncrna-replicates, echo=TRUE, fig.width=9, fig.height=4}
+loci <- c("PKN2-AS1", "MIR124-2HG", "DUBR")
+hits <- sig_interaction_nc[match(loci, sig_interaction_nc$symbol), ]
+stopifnot(identical(as.character(hits$symbol), loci))
+day80 <- as.character(dds$ageing_treatment_days) %in% c("0", "20")
+normalized <- counts(dds, normalized = TRUE)[hits$gene_id, day80, drop = FALSE]
+plot_data <- data.frame(
+  locus = factor(rep(loci, each = sum(day80)), levels = loci),
+  genotype = rep(dds$genotype[day80], length(loci)),
+  treatment = factor(rep(dds$ageing_treatment_days[day80], length(loci)),
+                     levels = c("0", "20"), labels = c("Control", "20 days")),
+  expression = as.vector(t(log2(normalized + 1)))
+)
+ggplot(plot_data, aes(treatment, expression, color = genotype, group = genotype)) +
+  stat_summary(geom = "line", fun = mean, position = position_dodge(width = 0.24)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.10, seed = 1,
+                                              dodge.width = 0.24)) +
+  facet_wrap(~ locus, scales = "free_y") +
+  scale_color_manual(values = c(APOE3 = "#166534", APOE4 = "#1D4ED8")) +
+  labs(x = NULL, y = "log2(DESeq2-normalized count + 1)", color = "Line") +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+Each point represents one biological replicate. Lines connect group means from separate organoids. PKN2-AS1 rose in APOE4 and fell in APOE3, while MIR124-2HG showed the reverse. DUBR increased more strongly in APOE3. These are gene-level response patterns in this line pair. MIR124-2HG expression leaves mature miR-124 abundance unresolved.
+
+## ncRNA isoforms
+
+Significant genes from the contrasts (APOE3 ageing, APOE4 ageing, and `genotype × ageing` interaction), were annotated in the previous step with respect to their RNA type to quantify the presence of ncRNA types such as scRNA, snoRNA, and snRNA.
+Because the provided count matrix contained gene-level rather than transcript-level counts, differential expression or differential usage of individual RNA isoforms could not be assessed directly. Therefore, an exploratory transcript-isoform annotation was performed. The Ensembl gene IDs of significant ncRNAs were mapped to annotated Ensembl transcript IDs using the R package `org.Hs.eg.db`. The resulting table shown below shows which annotated transcripts are associated with significant ncRNA genes. These transcript IDs represent potential RNA isoforms of the respective loci, but their individual expression levels or relative isoform usage cannot be inferred from the available gene-level count matrix. The gene HCG22 was associated with 9 Ensembl transcripts, TSNAX-DISC1 with 8, NPHP3-ACAD11 and SEPT5-GP1BB with 2 each, and P2RX5-TAX1BP3 with 1 transcript. 
+
+```{r ncrna-isoforms, message=FALSE}
+
+# Combine significant non-coding RNA genes from all ageing-related contrasts
+sig_nc_all <- bind_rows(
+  sig_apoe3_nc |>
+    mutate(comparison = "APOE3: 20d vs CTRL"),
+
+  sig_apoe4_nc |>
+    mutate(comparison = "APOE4: 20d vs CTRL"),
+
+  sig_interaction_nc |>
+    mutate(comparison = "Genotype × ageing interaction")
+) |>
+  distinct(comparison, ENSEMBL, .keep_all = TRUE)
+
+
+# Retrieve annotated ensembl transcripts
+nc_isoform_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(sig_nc_all$ENSEMBL),
+  keytype = "ENSEMBL",
+  columns = "ENSEMBLTRANS"
+) |>
+  filter(!is.na(ENSEMBLTRANS)) |>
+  distinct(ENSEMBL, ENSEMBLTRANS)
+
+
+# Count annotated transcripts per gene
+nc_isoform_summary <- nc_isoform_map |>
+  count(
+    ENSEMBL,
+    name = "n_annotated_transcripts"
+  ) |>
+  left_join(
+    sig_nc_all |>
+      select(
+        ENSEMBL,
+        symbol,
+        GENETYPE,
+        comparison
+      ),
+    by = "ENSEMBL"
+  ) |>
+  arrange(desc(n_annotated_transcripts))
+
+#nc_isoform_summary
+
+nc_transcript_mapping <- nc_isoform_map |>
+  left_join(
+    sig_nc_all |>
+      select(ENSEMBL, symbol, GENETYPE) |>
+      distinct(),
+    by = "ENSEMBL"
+  ) |>
+  select(
+    ENSEMBL,
+    symbol,
+    GENETYPE,
+    ENSEMBLTRANS
+  ) |>
+  distinct() |>
+  arrange(symbol, ENSEMBLTRANS)
+cat("Annotated transcripts associated with significant ncRNA genes:\n")
+nc_transcript_mapping
+```
+
+*[View R code in the Appendix](#code-ncrna-isoforms)*
+
+
+
+
+## circRNA 
+
+As mentioned, because only a gene-level count matrix was available for this analysis, circRNAs could not be detected or quantified directly. Therefore, an exploratory host-gene annotation was performed instead. The human circRNA BED annotation from circAtlas v3.0 was downloaded (Wu, W., et al., 2024), host gene names were extracted from the circAtlas identifiers, and these were matched to gene symbols from the differential-expression results. For each contrast, the proportion of significantly differentially expressed genes that were known host genes for at least one circRNA catalogued in circAtlas was calculated.
+\newpage
+
+```{r circ-all}
+
+# Load human circRNA annotation from circAtlas
+circ <- read.delim(
+  "data/human_bed_v3.0.txt",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Extract host gene names from circAtlas IDs
+circ$host_gene <- sub("^hsa-", "", circ$circAltas_ID)
+circ$host_gene <- sub("_[0-9]+$", "", circ$host_gene)
+
+# Exclude intergenic circRNAs and count catalogued circRNAs per host gene
+circ_hosts <- circ |>
+  filter(host_gene != "intergenic") |>
+  count(host_gene, name = "n_circRNAs")
+
+# Calculate the proportion of significant genes that are known circRNA host genes
+circ_host_percentage <- function(df, circ_hosts) {
+
+  sig <- df |>
+    filter(
+      !is.na(padj),
+      padj < 0.05,
+      abs(log2FoldChange) > 1
+    )
+
+  sig_circ <- sig |>
+    left_join(
+      circ_hosts,
+      by = c("symbol" = "host_gene")
+    )
+
+  tibble(
+    n_significant = nrow(sig),
+    n_circ_hosts = sum(!is.na(sig_circ$n_circRNAs)),
+    percent_circ_hosts =
+      100 * sum(!is.na(sig_circ$n_circRNAs)) / nrow(sig)
+  )
+}
+
+# Compare circRNA host-gene proportions across differential-expression contrasts
+circ_summary <- bind_rows(
+  circ_host_percentage(genotype_df, circ_hosts) |>
+    mutate(comparison = "APOE4 vs APOE3 (CTRL)"),
+
+  circ_host_percentage(apoe3_df, circ_hosts) |>
+    mutate(comparison = "APOE3: 20d vs 0d"),
+
+  circ_host_percentage(apoe4_df, circ_hosts) |>
+    mutate(comparison = "APOE4: 20d vs 0d"),
+
+  circ_host_percentage(interaction_df, circ_hosts) |>
+    mutate(comparison = "Genotype × ageing")
+) |>
+  select(
+    comparison,
+    n_significant,
+    n_circ_hosts,
+    percent_circ_hosts
+  )
+
+cat("A summary of the number of significant genes for the respective contrasts 
+    \n and the proportion of circRNA hosts associated with them:\n")
+circ_summary
+
+```
+
+
+*[View R code in the Appendix](#code-circrna-analysis)*
+
+
+Across the four differential-expression contrasts, 43.5–51.6% of significant genes were annotated as host genes for at least one circRNA catalogued in circAtlas, including 48.9% of genes showing a significant genotype × ageing interaction. These results indicate that a substantial proportion of transcriptionally affected loci in the organoids are known to generate circRNAs, but they do not demonstrate that the corresponding circRNAs were expressed or differentially regulated in the organoids. The high proportion of differentially expressed genes that are known circRNA host genes is consistent with the widespread occurrence of circRNA-producing loci in neural tissue (Hanan, M., et al., 2017).
+
+\newpage
+
+# Discussion
+
+At the matched day-80 harvest, both lines showed a broad transcriptional response to neddylation inhibition. The interaction tests the difference between the two responses directly. The relatively weaker neuronal and synaptic transcriptional response in APOE4 and the differing responses at selected non-coding loci nominate follow-up questions about cell state and composition. Bulk expression alone cannot distinguish cell-state regulation from shifts in the cells present or establish that the treatment recapitulates natural ageing. The single parental line and single edited derivative also leave genotype inseparable from clone and editing status.
+
+## Things I could have done further
+
+- Refit the four day-80 contrasts using only day-80 libraries and check how much any one library influences the interaction. Clarify batch and library preparation details to investigate the group-wide STAR difference.
+- Use a complementary gene-set test on ranked or modelled expression and compare the resulting themes with directional KEGG over-representation.
+- Compare the fraction of known circRNA hosts among discoveries with a background of comparably expressed tested genes. Catalogue coverage, gene length and transcript complexity can affect that comparison.
+- Request transcript-level quantifications to study isoform expression and usage, and the original reads and a back-splice junction workflow to quantify circular RNA. With more organoid lines or donors, test whether the observed RNA responses generalize.
+
+# Literature and data resources
+
+- Saurat, N., Minotti, A. P., Rahman, M. T., Sikder, T., Zhang, C., Cornacchia, D., Jungverdorben, J., Ciceri, G., Betel, D., & Studer, L. (2024). 
+  *Genome-wide CRISPR screen identifies neddylation as a regulator of neuronal ageing and AD neurodegeneration.*
+  Cell Stem Cell, 31(8), 1162–1174.e8.
+  https://doi.org/10.1016/j.stem.2024.06.001
+  
+- Qu, T., Zhang, C., Lu, X., Dai, J., He, X., Li, W., Han, L., Yin, D., & Zhang, E. (2025). 
+  *8q24 derived ZNF252P promotes tumorigenesis by driving phase separation to activate c-Myc mediated feedback loop.*
+  Nature Communications 16, 1986 (2025) 
+  https://doi.org/10.1038/s41467-025-56879-7
+  
+- GeneCards. (2026). 
+  *PMCH gene Pro-Melanin Concentrating Hormone*. 
+  GeneCards Human Gene Database 
+  https://www.genecards.org/card/PMCH
+  
+- GeneCards. (2026). 
+  *ENSG00000269993 Gene – Novel Transcript*. 
+  GeneCards Human Gene Database 
+  https://www.genecards.org/card/ENSG00000269993  
+  
+- Hanan, M., Soreq, H., & Kadener, S. (2017). 
+  *CircRNAs in the brain*
+  RNA Biology, 14(8), pp. 1028–1034.
+  https://doi.org/10.1080/15476286.2016.1255398
+  
+  
+- Love, M. I., Huber, W., & Anders, S. (2014).  
+  *Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2.*  
+  Genome Biology, 15, 550.  
+  https://doi.org/10.1186/s13059-014-0550-8
+
+- Wu, W., Zhao, F., & Zhang, J. (2024).  
+  *circAtlas 3.0: a gateway to 3 million curated vertebrate circular RNAs based on a standardized nomenclature scheme.*  
+  Nucleic Acids Research, 52(D1), D52-D60.  
+  https://doi.org/10.1093/nar/gkad770
+
+
+- DESeq2 Bioconductor vignette:  
+  https://bioconductor.org/packages/DESeq2/
+
+- RNA-seq workflow using DESeq2:  
+  https://bioconductor.org/packages/release/workflows/html/rnaseqGene.html
+
+- Harvard Chan Bioinformatics Core: Differential expression with DESeq2:  
+  https://hbctraining.github.io/DGE_workshop/lessons/05_DGE_DESeq2_analysis2.html
+
+- Harvard Chan Bioinformatics Core: Gene filtering and exploratory RNA-seq analysis:  
+  https://bioinformatics-core-shared-training.github.io/Bulk_RNAseq_Course_Nov22/Bulk_RNAseq_Course_Base/Markdowns/07_Data_Exploration.html
+  
+- Bulk RNA-seq differential-expression visualization tutorial:  
+  https://hds-sandbox.github.io/bulk_RNAseq_course/develop/07c_DEA_visualization.html
+
+- clusterProfiler / enrichplot documentation for functional enrichment visualization:  
+  https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+
+
+
+
+\newpage
+# Appendix: R code {#appendix-r-code}
+
+The code below reproduces the analyses and figures shown in the main report.
+
+## Data loading and preprocessing
+
+### Setup and data loading
+
+```r
+knitr::opts_chunk$set(echo = FALSE)
+
+library(DESeq2)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(edgeR)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(genefilter)
+library(ashr)
+library(ggrepel)
+library(patchwork)
+
+
+# Load count matrix and metadata
+countMatrix <- read.delim("data/counts.tsv", row.names = 1, check.names = FALSE)
+#summary(countMatrix)
+metadata <- read.csv("data/RNAseq_challenge_metadata.csv")
+# Are the samples in the same order?
+stopifnot(!anyDuplicated(metadata$sample), !anyDuplicated(colnames(countMatrix)),
+          setequal(metadata$sample, colnames(countMatrix)))
+countMatrix <- countMatrix[, metadata$sample, drop = FALSE]
+# Assign sample names to rows
+rownames(metadata) <- metadata[, 1]
+```
+
+### Library size {#code-library-size}
+
+```r
+library_sizes <- colSums(countMatrix)
+
+#summary(library_sizes/1e6)
+
+plot_df <- metadata
+plot_df$library_size_m <- colSums(countMatrix)[plot_df$sample] / 1e6
+plot_df$group <- paste(
+  plot_df$genotype,
+  plot_df$ageing_treatment_days,
+  sep = "_"
+)
+
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = rev(plot_df$sample)
+)
+
+ggplot(
+  plot_df,
+  aes(
+    x = sample,
+    y = library_size_m,
+    fill = group
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Library size per sample",
+    x = NULL,
+    y = "Total counts (millions)",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+### Experimental design
+
+```r
+metadata$ageing_treatment_days <- factor(
+  metadata$ageing_treatment_days,
+  levels = c("0", "10", "20")
+)
+
+metadata$genotype <- factor(
+  metadata$genotype,
+  levels = c("APOE3", "APOE4")
+)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = countMatrix,
+  colData = metadata,
+  design = ~ genotype * ageing_treatment_days
+)
+
+#model.matrix(
+#  ~ genotype * ageing_treatment_days,
+#  data = metadata
+#)
+```
+
+### Gene filtering
+
+```r
+cat("The number of genes prior to filtering is", nrow(dds))
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep, ]
+cat("The number of genes after filtering is", nrow(dds))
+```
+
+### Variance-stabilizing transformation
+
+```r
+vsd <- vst(dds, blind = FALSE)
+#head(assay(vsd), 3)
+```
+
+## Sample-level quality control
+
+### Sample-distance heatmap {#code-sample-distance}
+
+```r
+sampleDists <- dist(t(assay(vsd)))
+
+sampleDistMatrix <- as.matrix(sampleDists)
+
+colors <- colorRampPalette(
+  rev(brewer.pal(9, "Oranges"))
+)(255)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  col = colors
+)
+
+```
+
+### Sample correlation {#code-sample-corr}
+
+```r
+# Pearson correlation between samples
+sampleCor <- cor(
+  assay(vsd),
+  method = "pearson"
+)
+
+#pheatmap(
+#  sampleCor,
+#  clustering_distance_rows = "correlation",
+#  clustering_distance_cols = "correlation",
+#  main = "Pearson correlation between samples"
+#)
+
+# Show correlation matrix
+#round(sampleCor, 3)
+
+#sampleCor[
+#  c("APOE3_AGED10D_1", "APOE3_AGED10D_2", "APOE3_AGED10D_3"),
+#  c("APOE3_AGED10D_1", "APOE3_AGED10D_2", "APOE3_AGED10D_3")
+#]
+
+# Create table for printing
+sample_cor_table <- data.frame(
+  Sample = c(
+    "APOE3_CTRL",
+    "APOE3_AGED10",
+    "APOE3_AGED20",
+    "APOE4_CTRL",
+    "APOE4_AGED10",
+    "APOE4_AGED20"
+  ),
+  `Correlation Range` = c(
+    "0.9954–0.9983",
+    "0.9895–0.9973",
+    "0.9961–0.9979",
+    "0.9934–0.9971",
+    "0.9933–0.9974",
+    "0.9963–0.9983"
+  )
+)
+
+knitr::kable(
+  sample_cor_table,
+  caption = "Pearson correlation ranges between biological replicates."
+)
+
+```
+
+### Principal component analysis {#code-pca}
+
+```r
+pca_df <- plotPCA(
+  vsd,
+  intgroup = c("genotype", "ageing_treatment_days"),
+  ntop = 500,
+  returnData = TRUE
+)
+
+percentVar <- round(
+  100 * attr(pca_df, "percentVar")
+)
+
+ggplot(
+  pca_df,
+  aes(
+    PC1,
+    PC2,
+    color = genotype,
+    shape = ageing_treatment_days
+  )
+) +
+  geom_point(size = 4) +
+  labs(
+    title = "PCA of VST-transformed gene expression",
+    x = paste0("PC1 (", percentVar[1], "%)"),
+    y = paste0("PC2 (", percentVar[2], "%)"),
+    color = "APOE genotype",
+    shape = "Ageing treatment (days)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+## Differential expression analysis
+
+### DESeq2 model fitting
+
+```r
+dds <- DESeq(dds)
+#resultsNames(dds)
+```
+
+### Baseline APOE4 vs APOE3 contrast {#contrast-genotype}
+
+```r
+res_genotype_CTRL <- results(
+  dds,
+  name = "genotype_APOE4_vs_APOE3",
+  alpha = 0.05
+)
+
+# Shrink LFC for stabilizing effect-size
+res_genotype_CTRL_shrunk <- lfcShrink(
+    dds,
+    coef = "genotype_APOE4_vs_APOE3",
+    type = "apeglm")
+
+#summary(res_genotype_CTRL)
+```
+
+### 20-day ageing effect in APOE3 {#contrast-apoe3}
+
+```r
+res_ageing_APOE3 <- results(
+  dds,
+  name = "ageing_treatment_days_20_vs_0",
+  alpha = 0.05
+)
+# Shrink LFC
+res_ageing_APOE3_shrunk <- lfcShrink(
+    dds,
+    coef = "ageing_treatment_days_20_vs_0",
+    type = "apeglm")
+
+#summary(res_ageing_APOE3)
+```
+
+### 20-day ageing effect in APOE4 {#contrast-apoe4}
+
+```r
+res_ageing_APOE4 <- results(
+  dds,
+  contrast = list(
+    c(
+      "ageing_treatment_days_20_vs_0",
+      "genotypeAPOE4.ageing_treatment_days20"
+    )
+  ),
+  alpha = 0.05
+)
+
+# Use ashr for shrinkage instead of apeglm because of the specified APOE4 x ageing 
+# effect being a linear combination
+res_ageing_APOE4_shrunk <- lfcShrink(
+  dds,
+  res = res_ageing_APOE4,
+  type = "ashr"
+)
+
+#summary(res_ageing_APOE4)
+```
+
+### Genotype-by-ageing interaction {#contrast-interaction}
+
+```r
+# unshrunken results
+res_interaction_20 <- results(
+    dds,
+    name = "genotypeAPOE4.ageing_treatment_days20",
+    alpha = 0.05
+)
+
+# shrunken LFC
+res_interaction_20_shrunk <- lfcShrink(
+    dds,
+    coef = "genotypeAPOE4.ageing_treatment_days20",
+    type = "apeglm"
+)
+#summary(res_interaction_20)
+#summary(res_interaction_20_shrunk)
+```
+
+### MA plots {#code-ma-plots}
+
+```r
+# Define plot composition
+par(
+  mfrow = c(2, 2),
+  mar = c(4, 4, 3, 1),
+  mgp = c(2.5, 0.8, 0),
+  cex = 0.85
+)
+
+DESeq2::plotMA(
+  res_genotype_CTRL_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "APOE4 vs APOE3 (CTRL)"
+)
+
+DESeq2::plotMA(
+  res_ageing_APOE3_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "20d ageing vs CTRL (APOE3)"
+)
+
+DESeq2::plotMA(
+  res_ageing_APOE4_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "20d ageing vs CTRL (APOE4)"
+)
+
+DESeq2::plotMA(
+  res_interaction_20_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "Genotype × Ageing interaction"
+)
+
+par(mfrow = c(1, 1))
+```
+
+### Shrunk versus unshrunk interaction LFCs
+
+```r
+lfc_compare <- data.frame(
+  unshrunk = res_interaction_20$log2FoldChange,
+  shrunk   = res_interaction_20_shrunk$log2FoldChange
+)
+
+#head(lfc_compare)
+
+#summary(abs(lfc_compare$unshrunk - lfc_compare$shrunk))
+#lfc_compare$diff <- abs(
+#  lfc_compare$unshrunk - lfc_compare$shrunk
+#)
+
+# Total number of genes
+#nrow(lfc_compare)
+
+# Difference > 0.5 log2FC
+#sum(lfc_compare$diff > 0.5, na.rm = TRUE)
+
+# Difference > 1 log2FC
+#sum(lfc_compare$diff > 1, na.rm = TRUE)
+# There are 4200 genes whose LFC after shrinkage was differing by 0.5, 
+# and 1260 genes whose LFC after shrinkage differed by 1260. 
+# The analysis proceeds working with unshrunk LFCs.
+```
+
+### Highlighted interaction MA plot {#code-top-interaction-gene}
+
+```r
+DESeq2::plotMA(
+  res_interaction_20_shrunk,
+  alpha = 0.05,
+  ylim = c(-10, 10),
+  main = "Genotype × Ageing interaction"
+)
+
+# Choose most significant gene based on the original Wald-test results
+topGene <- rownames(res_interaction_20)[
+  which.min(res_interaction_20$padj)
+]
+
+with(res_interaction_20_shrunk[topGene, ], {
+  points(
+    baseMean,
+    log2FoldChange,
+    col = "red",
+    pch = 1,
+    cex = 2.5,
+    lwd = 2
+  )
+
+  text(
+    baseMean,
+    log2FoldChange,
+    topGene,
+    pos = 2,
+    col = "red"
+  )
+})
+
+```
+
+### Gene annotation
+
+```r
+# Function to annotate the DEA results
+# With kegg procedure, don't need this mapping, but the one with entrezid
+annotate_results <- function(res) {
+  df <- as.data.frame(res)
+  df$gene_id <- rownames(df)
+  df$ENSEMBL <- sub(
+    "\\..*$",
+    "",
+    rownames(df)
+  )
+  df$symbol <- mapIds(
+    org.Hs.eg.db,
+    keys = df$ENSEMBL,
+    keytype = "ENSEMBL",
+    column = "SYMBOL",
+    multiVals = "first"
+  )
+  df
+}
+# Function call
+genotype_df <- annotate_results(res_genotype_CTRL)
+apoe3_df <- annotate_results(res_ageing_APOE3)
+apoe4_df <- annotate_results(res_ageing_APOE4)
+interaction_df <- annotate_results(res_interaction_20)
+```
+
+### Significant interaction genes
+
+```r
+sig_interaction <- interaction_df[
+  !is.na(interaction_df$padj) &
+    interaction_df$padj < 0.05 &
+    abs(interaction_df$log2FoldChange) > 1,
+]
+
+#nrow(sig_interaction)
+```
+
+## Volcano plots {#code-volcano-analysis}
+
+### Volcano-plot data preparation
+
+```r
+# Function to create volcano dataframes for plotting
+make_volcano_df <- function(df, comparison) {
+
+  df$comparison <- comparison
+
+  df$status <- "Not significant"
+
+  df$status[
+    !is.na(df$padj) &
+      df$padj < 0.05 &
+      df$log2FoldChange > 1
+  ] <- "Positive LFC"
+
+  df$status[
+    !is.na(df$padj) &
+      df$padj < 0.05 &
+      df$log2FoldChange < -1
+  ] <- "Negative LFC"
+
+  df$label <- ifelse(
+    is.na(df$symbol),
+    df$ENSEMBL,
+    df$symbol
+  )
+
+  df
+}
+
+# Function call
+volcano_df <- bind_rows(
+  make_volcano_df(
+    genotype_df,
+    "APOE4 vs APOE3 (CTRL)"
+  ),
+  make_volcano_df(
+    apoe3_df,
+    "20d ageing vs CTRL (APOE3)"
+  ),
+  make_volcano_df(
+    apoe4_df,
+    "20d ageing vs CTRL (APOE4)"
+  ),
+  make_volcano_df(
+    interaction_df,
+    "Genotype × Ageing interaction"
+  )
+)
+
+volcano_df$comparison <- factor(
+  volcano_df$comparison,
+  levels = c(
+    "APOE4 vs APOE3 (CTRL)",
+    "20d ageing vs CTRL (APOE3)",
+    "20d ageing vs CTRL (APOE4)",
+    "Genotype × Ageing interaction"
+  )
+)
+
+# Label top 3 genes determined by the lowest padj value
+top3 <- volcano_df %>%
+  filter(status != "Not significant") %>%
+  group_by(comparison, status) %>%
+  slice_min(
+    order_by = padj,
+    n = 3,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+```
+
+### Volcano-plot figure
+
+```r
+# Volcano plots
+ggplot(
+  volcano_df,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = status
+  )
+) +
+  geom_point(
+    alpha = 0.5,
+    size = 0.8
+  ) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    data = top3,
+    aes(label = label),
+    size = 3,
+    box.padding = 0.4,
+    point.padding = 0.2,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  facet_wrap(
+    ~ comparison,
+    ncol = 2
+  ) +
+  labs(
+    title = "Differential gene expression",
+    x = "log2 fold change",
+    y = "-log10 adjusted p-value",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 16),
+    strip.text = element_text(size = 11),
+    legend.text = element_text(size = 10)
+)
+```
+
+## KEGG pathway enrichment and dotplots {#code-pathway-enrichment}
+
+### KEGG background and identifier conversion
+
+```r
+# Function to map ensembl IDs to entrez IDs
+to_entrez <- function(genes) {
+  suppressWarnings(
+    suppressMessages(
+      bitr(
+        genes,
+        fromType = "ENSEMBL",
+        toType = "ENTREZID",
+        OrgDb = org.Hs.eg.db
+      )
+    )
+  ) |>
+    pull(ENTREZID) |>
+    unique()
+}
+
+# Background: all genes retained in the DESeq2 analysis
+background_genes <- unique(
+  sub(
+    "\\..*$",
+    "",
+    rownames(dds)
+  )
+)
+
+background_entrez <- to_entrez(background_genes)
+```
+
+### APOE3 KEGG enrichment and dotplots
+
+```r
+### APOE3 ageing response
+# Genes with increased expression after 20d ageing in APOE3
+apoe3_up <- unique(
+  apoe3_df$ENSEMBL[
+    !is.na(apoe3_df$padj) &
+      apoe3_df$padj < 0.05 &
+      apoe3_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with decreased expression after 20d ageing in APOE3
+apoe3_down <- unique(
+  apoe3_df$ENSEMBL[
+    !is.na(apoe3_df$padj) &
+      apoe3_df$padj < 0.05 &
+      apoe3_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+apoe3_up_entrez <- to_entrez(apoe3_up)
+apoe3_down_entrez <- to_entrez(apoe3_down)
+
+# Run KEGG analysis
+kegg_APOE3_up <- enrichKEGG(
+  gene = apoe3_up_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_APOE3_down <- enrichKEGG(
+  gene = apoe3_down_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# Plot APOE3 KEGG results
+p1 <- dotplot(
+  kegg_APOE3_up,
+  showCategory = 10
+) +
+  ggtitle("APOE3: KEGG pathways increased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p2 <- dotplot(
+  kegg_APOE3_down,
+  showCategory = 10
+) +
+  ggtitle("APOE3: KEGG pathways decreased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+### APOE4 KEGG enrichment and dotplots
+
+```r
+### APOE4 ageing response
+# Genes with increased expression after 20d ageing in APOE4
+apoe4_up <- unique(
+  apoe4_df$ENSEMBL[
+    !is.na(apoe4_df$padj) &
+      apoe4_df$padj < 0.05 &
+      apoe4_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with decreased expression after 20d ageing in APOE4
+apoe4_down <- unique(
+  apoe4_df$ENSEMBL[
+    !is.na(apoe4_df$padj) &
+      apoe4_df$padj < 0.05 &
+      apoe4_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+apoe4_up_entrez <- to_entrez(apoe4_up)
+apoe4_down_entrez <- to_entrez(apoe4_down)
+
+# APOE4 KEGG
+kegg_APOE4_up <- enrichKEGG(
+  gene = apoe4_up_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_APOE4_down <- enrichKEGG(
+  gene = apoe4_down_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# Plot APOE4 KEGG results
+p3 <- dotplot(
+  kegg_APOE4_up,
+  showCategory = 10
+) +
+  ggtitle("APOE4: KEGG pathways increased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p4 <- dotplot(
+  kegg_APOE4_down,
+  showCategory = 10
+) +
+  ggtitle("APOE4: KEGG pathways decreased after 20d ageing") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+### Genotype-by-ageing interaction KEGG enrichment and dotplots
+
+```r
+### Genotype-by-ageing interaction
+# Genes with a higher/more positive ageing response in APOE4 than APOE3
+
+interaction_higher_ensembl <- unique(
+  interaction_df$ENSEMBL[
+    !is.na(interaction_df$padj) &
+      interaction_df$padj < 0.05 &
+      interaction_df$log2FoldChange > 1
+  ]
+)
+
+# Genes with a lower/more negative ageing response in APOE4 than APOE3
+interaction_lower_ensembl <- unique(
+  interaction_df$ENSEMBL[
+    !is.na(interaction_df$padj) &
+      interaction_df$padj < 0.05 &
+      interaction_df$log2FoldChange < -1
+  ]
+)
+
+# Map ensembl to entrez
+interaction_higher_entrez <- to_entrez(interaction_higher_ensembl)
+interaction_lower_entrez <- to_entrez(interaction_lower_ensembl)
+
+# genotype * treatment KEGG
+kegg_interaction_higher <- enrichKEGG(
+  gene = interaction_higher_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+kegg_interaction_lower <- enrichKEGG(
+  gene = interaction_lower_entrez,
+  universe = background_entrez,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# genotype * treatment plot
+p5 <- dotplot(
+  kegg_interaction_higher,
+  showCategory = 10
+) +
+  ggtitle("Interaction: higher ageing response in APOE4") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+
+p6 <- dotplot(
+  kegg_interaction_lower,
+  showCategory = 10
+) +
+  ggtitle("Interaction: lower ageing response in APOE4") +
+  theme(
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+### Combined KEGG dotplot figure
+
+```r
+
+# Plot the six KEGG enrichment results together
+p1 <- p1 + theme(plot.margin = margin(10, 10, 30, 10))
+p2 <- p2 + theme(plot.margin = margin(10, 10, 30, 10))
+p3 <- p3 + theme(plot.margin = margin(10, 10, 30, 10))
+p4 <- p4 + theme(plot.margin = margin(10, 10, 30, 10))
+p5 <- p5 + theme(plot.margin = margin(10, 10, 10, 10))
+p6 <- p6 + theme(plot.margin = margin(10, 10, 10, 10))
+
+combined_kegg <-
+  (p1 | p2) /
+  (p3 | p4) /
+  (p5 | p6)
+combined_kegg
+```
+
+## Representative interaction pathways {#code-interaction-scatter}
+
+### Selected KEGG pathway genes and interaction patterns
+
+```r
+# One row per gene symbol for the genotype-specific ageing contrasts (unique)
+apoe3_unique <- apoe3_df |>
+  filter(!is.na(symbol)) |>
+  arrange(padj) |>
+  distinct(symbol, .keep_all = TRUE)
+
+apoe4_unique <- apoe4_df |>
+  filter(!is.na(symbol)) |>
+  arrange(padj) |>
+  distinct(symbol, .keep_all = TRUE)
+
+# Extract entrez IDs belonging to the selected KEGG pathways
+cellcycle_entrez <- kegg_interaction_higher@result |>
+  filter(Description == "Pathways in cancer") |>
+  pull(geneID) |>
+  strsplit("/") |>
+  unlist()
+
+glutamate_entrez <- kegg_interaction_lower@result |>
+  filter(Description == "Neuroactive ligand-receptor interaction") |>
+  pull(geneID) |>
+  strsplit("/") |>
+  unlist()
+
+# Convert pathway entrez IDs to gene symbols
+entrez_to_symbol <- function(ids) {
+  suppressMessages(
+    mapIds(
+      org.Hs.eg.db,
+      keys = ids,
+      keytype = "ENTREZID",
+      column = "SYMBOL",
+      multiVals = "first"
+    )
+  ) |>
+    unname() |>
+    unique() |>
+    na.omit()
+}
+
+cellcycle_symbols <- entrez_to_symbol(cellcycle_entrez)
+glutamate_symbols <- entrez_to_symbol(glutamate_entrez)
+
+
+# Decompose the interactio'n by calculating the difference 
+# (APOE3- and APOE4-specific ageing effects) 
+# for 'pathways in cancer' genes driving the interaction enrichment
+
+cancer_pathway_changes <- inner_join(
+  apoe3_unique |>
+    select(symbol, APOE3_LFC = log2FoldChange),
+  apoe4_unique |>
+    select(symbol, APOE4_LFC = log2FoldChange),
+  by = "symbol"
+) |>
+  filter(symbol %in% cellcycle_symbols) |>
+  mutate(
+    interaction = APOE4_LFC - APOE3_LFC,
+    pattern = case_when(
+      APOE3_LFC < 0 & APOE4_LFC > 0 ~
+        "down in APOE3, up in APOE4",
+      APOE3_LFC < 0 & APOE4_LFC <= 0 &
+        APOE4_LFC > APOE3_LFC ~
+        "decreased in both, weaker in APOE4",
+      APOE3_LFC >= 0 & APOE4_LFC > APOE3_LFC ~
+        "increased more strongly in APOE4",
+      TRUE ~ "other"
+    )
+  ) |>
+  arrange(desc(interaction))
+
+
+# Decompose the interaction by calculating the difference 
+# (APOE3- and APOE4-specific ageing effects) 
+# for 'Neuroactive ligand-receptor interaction' genes
+# driving the interaction enrichment
+
+ligand_receptor_interaction_changes <- inner_join(
+  apoe3_unique |>
+    select(symbol, APOE3_LFC = log2FoldChange),
+  apoe4_unique |>
+    select(symbol, APOE4_LFC = log2FoldChange),
+  by = "symbol"
+) |>
+  filter(symbol %in% glutamate_symbols) |>
+  mutate(
+    interaction = APOE4_LFC - APOE3_LFC,
+    pattern = case_when(
+      APOE3_LFC > 0 & APOE4_LFC < 0 ~
+        "up in APOE3, down in APOE4",
+      APOE3_LFC > 0 & APOE4_LFC >= 0 &
+        APOE4_LFC < APOE3_LFC ~
+        "increased in both, weaker in APOE4",
+      APOE3_LFC <= 0 & APOE4_LFC < APOE3_LFC ~
+        "decreased more strongly in APOE4",
+      TRUE ~ "other"
+    )
+  ) |>
+  arrange(interaction)
+
+#cat ("Summary of the cancer pathway changes in genotypes:\n")
+#table(cancer_pathway_changes$pattern)
+#cat ("Summary of the ligand-receptor interaction pathway changes in genotypes:\n")
+#table(ligand_receptor_interaction_changes$pattern)
+```
+
+### Interaction-pattern barplots
+
+```r
+
+# Count expression-pattern categories based on differences in LFC
+cancer_pattern_counts <- cancer_pathway_changes |>
+  count(pattern)
+
+ligand_receptor_pattern_counts <- ligand_receptor_interaction_changes |>
+  count(pattern)
+
+# Plot cell cycle genes
+p_cellcycle_bar <- ggplot(
+  cancer_pattern_counts,
+  aes(
+    x = reorder(pattern, n),
+    y = n
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(
+    breaks = seq(
+      0,
+      max(cancer_pattern_counts$n) + 10,
+      by = 10
+    )
+  ) +
+  labs(
+    title = "KEGG: Cancer pathways",
+    subtitle = "Higher ageing response in APOE4",
+    x = NULL,
+    y = "Number of genes"
+  ) +
+  theme_minimal(base_size = 17)
+
+
+# Plot synaptic genes
+p_synaptic_bar <- ggplot(
+  ligand_receptor_pattern_counts,
+  aes(
+    x = reorder(pattern, n),
+    y = n
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "KEGG: Neuroactive ligand-receptor interaction",
+    subtitle = "Lower ageing response in APOE4",
+    x = NULL,
+    y = "Number of genes"
+  ) +
+  theme_minimal(base_size = 17) 
+
+
+p_cellcycle_bar | p_synaptic_bar
+
+```
+
+## Non-coding RNA analysis {#code-ncrna-analysis}
+
+```r
+# Extract gene types
+gene_types <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = interaction_df$ENSEMBL,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENETYPE")
+)
+
+# Annotate interaction results with gene type
+interaction_df <- interaction_df |>
+  left_join(
+    gene_types |>
+      distinct(ENSEMBL, .keep_all = TRUE),
+    by = "ENSEMBL"
+  )
+
+#sort(
+#  table(interaction_df$GENETYPE, useNA = "ifany"),
+#  decreasing = TRUE
+#)
+
+# Define non coding RNAs
+nc_types <- c(
+  "ncRNA",
+  "snoRNA",
+  "snRNA",
+  "scRNA"
+)
+
+# Subset significant interaction genes annotated as non-coding RNA
+sig_interaction_nc <- interaction_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+cat("Table of RNA genes marked as significantly differentially expressed 
+\nfor the contrasts:\n")
+table(sig_interaction_nc$GENETYPE)
+
+# Display the 20 most significant non-coding RNA interaction genes
+#sig_interaction_nc |>
+#  arrange(padj) |>
+#  select(
+#    ENSEMBL,
+#    symbol,
+#    GENETYPE,
+#    log2FoldChange,
+#    padj
+#  ) |>
+#  head(20)
+
+# Annotate ageing contrasts with gene type
+apoe3_df <- apoe3_df |>
+  left_join(gene_types |> distinct(ENSEMBL, .keep_all = TRUE),
+            by = "ENSEMBL")
+
+apoe4_df <- apoe4_df |>
+  left_join(gene_types |> distinct(ENSEMBL, .keep_all = TRUE),
+            by = "ENSEMBL")
+
+# Subset significant interaction genes annotated as non-coding RNA
+sig_apoe3_nc <- apoe3_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+sig_apoe4_nc <- apoe4_df |>
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1,
+    GENETYPE %in% nc_types
+  )
+
+# Summarize significant non-coding RNA genes by comparison and gene type
+nc_summary <- bind_rows(
+  apoe3_df |>
+    mutate(comparison = "APOE3: 20d vs CTRL"),
+  apoe4_df |>
+    mutate(comparison = "APOE4: 20d vs CTRL"),
+  interaction_df |>
+    mutate(comparison = "Genotype × ageing interaction")
+) |>
+  filter(
+    GENETYPE %in% nc_types,
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1
+  ) |>
+  count(comparison, GENETYPE)
+
+
+# Plot the significant ncRNA genes
+ggplot(
+  nc_summary,
+  aes(
+    x = GENETYPE,
+    y = n,
+    fill = comparison
+  )
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Significant non-coding RNAs",
+    x = "RNA type",
+    y = "Number of significant genes",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 17)
+
+```
+
+## ncRNA isoform annotation {#code-ncrna-isoforms}
+
+```r
+
+# Combine significant non-coding RNA genes from all ageing-related contrasts
+sig_nc_all <- bind_rows(
+  sig_apoe3_nc |>
+    mutate(comparison = "APOE3: 20d vs CTRL"),
+
+  sig_apoe4_nc |>
+    mutate(comparison = "APOE4: 20d vs CTRL"),
+
+  sig_interaction_nc |>
+    mutate(comparison = "Genotype × ageing interaction")
+) |>
+  distinct(comparison, ENSEMBL, .keep_all = TRUE)
+
+
+# Retrieve annotated ensembl transcripts
+nc_isoform_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(sig_nc_all$ENSEMBL),
+  keytype = "ENSEMBL",
+  columns = "ENSEMBLTRANS"
+) |>
+  filter(!is.na(ENSEMBLTRANS)) |>
+  distinct(ENSEMBL, ENSEMBLTRANS)
+
+
+# Count annotated transcripts per gene
+nc_isoform_summary <- nc_isoform_map |>
+  count(
+    ENSEMBL,
+    name = "n_annotated_transcripts"
+  ) |>
+  left_join(
+    sig_nc_all |>
+      select(
+        ENSEMBL,
+        symbol,
+        GENETYPE,
+        comparison
+      ),
+    by = "ENSEMBL"
+  ) |>
+  arrange(desc(n_annotated_transcripts))
+
+#nc_isoform_summary
+
+nc_transcript_mapping <- nc_isoform_map |>
+  left_join(
+    sig_nc_all |>
+      select(ENSEMBL, symbol, GENETYPE) |>
+      distinct(),
+    by = "ENSEMBL"
+  ) |>
+  select(
+    ENSEMBL,
+    symbol,
+    GENETYPE,
+    ENSEMBLTRANS
+  ) |>
+  distinct() |>
+  arrange(symbol, ENSEMBLTRANS)
+cat("Annotated transcripts associated with significant ncRNA genes.\n")
+nc_transcript_mapping
+```
+
+## circRNA host-gene annotation {#code-circrna-analysis}
+
+```r
+
+# Load human circRNA annotation from circAtlas
+circ <- read.delim(
+  "data/human_bed_v3.0.txt",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Extract host gene names from circAtlas IDs
+circ$host_gene <- sub("^hsa-", "", circ$circAltas_ID)
+circ$host_gene <- sub("_[0-9]+$", "", circ$host_gene)
+
+# Exclude intergenic circRNAs and count catalogued circRNAs per host gene
+circ_hosts <- circ |>
+  filter(host_gene != "intergenic") |>
+  count(host_gene, name = "n_circRNAs")
+
+# Calculate the proportion of significant genes that are known circRNA host genes
+circ_host_percentage <- function(df, circ_hosts) {
+
+  sig <- df |>
+    filter(
+      !is.na(padj),
+      padj < 0.05,
+      abs(log2FoldChange) > 1
+    )
+
+  sig_circ <- sig |>
+    left_join(
+      circ_hosts,
+      by = c("symbol" = "host_gene")
+    )
+
+  tibble(
+    n_significant = nrow(sig),
+    n_circ_hosts = sum(!is.na(sig_circ$n_circRNAs)),
+    percent_circ_hosts =
+      100 * sum(!is.na(sig_circ$n_circRNAs)) / nrow(sig)
+  )
+}
+
+# Compare circRNA host-gene proportions across differential-expression contrasts
+circ_summary <- bind_rows(
+  circ_host_percentage(genotype_df, circ_hosts) |>
+    mutate(comparison = "APOE4 vs APOE3 (CTRL)"),
+
+  circ_host_percentage(apoe3_df, circ_hosts) |>
+    mutate(comparison = "APOE3: 20d vs 0d"),
+
+  circ_host_percentage(apoe4_df, circ_hosts) |>
+    mutate(comparison = "APOE4: 20d vs 0d"),
+
+  circ_host_percentage(interaction_df, circ_hosts) |>
+    mutate(comparison = "Genotype × ageing")
+) |>
+  select(
+    comparison,
+    n_significant,
+    n_circ_hosts,
+    percent_circ_hosts
+  )
+
+cat("A summary of the number of significant genes for the respective contrasts
+\n and the proportion of circRNA hosts associated with them:\n")
+circ_summary
+
+```
+
+
+
+# Session information
+
+```{r session-information}
+sessionInfo()
+```

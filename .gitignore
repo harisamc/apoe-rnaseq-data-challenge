@@ -1,0 +1,11 @@
+/data/*
+!/data/README.md
+/reference/
+/output/
+*.html
+*_files/
+_cache/
+.Rhistory
+.RData
+.DS_Store
+/analysis.R
