@@ -1,5 +1,7 @@
 # APOE RNA-seq Data Challenge
 
+[Read the original challenge report (PDF)](reference/data_challenge_HMC.pdf)
+
 ## Introduction
 
 **How do APOE genotype and induced ageing affect the transcriptional state of human brain organoids, and does the response to treatment differ between the two APOE lines?**
@@ -63,4 +65,4 @@ Rendering requires Pandoc. A full render queries the KEGG API. For an offline ve
 Rscript -e 'rmarkdown::render("analysis.Rmd", output_format = "html_document", output_dir = "output", params = list(run_kegg = FALSE))'
 ```
 
-To extract the executable code for inspection, run `knitr::purl("analysis.Rmd")` in R. The R Markdown is the executable source of the report. For PDF, use `output_format = "pdf_document"` with a LaTeX installation. The source report is [analysis.Rmd](analysis.Rmd). The original submission is available locally in `reference/` when supplied. Rendered analyses and the original submission are kept local.
+To extract the executable code for inspection, run `knitr::purl("analysis.Rmd")` in R. The R Markdown is the executable source of the report. For PDF, use `output_format = "pdf_document"` with a LaTeX installation. The source report is [analysis.Rmd](analysis.Rmd). Newly rendered reports are saved locally in `output/`.

@@ -1,5 +1,6 @@
 /data/*
-/reference/
+/reference/*
+!/reference/data_challenge_HMC.pdf
 /output/
 *.html
 !/data/README.md
