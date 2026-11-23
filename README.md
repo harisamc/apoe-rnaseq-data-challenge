@@ -1,8 +1,26 @@
 # APOE RNA-seq Data Challenge
 
-Bulk RNA-seq analysis of how APOE line and neddylation inhibition relate to transcription in human brain organoids. This repository covers a DESeq2 analysis, KEGG pathways analysis and descriptive RNA analysis. The portfolio revision adds explicit MultiQC interpretation, a replicate-level look at selected non-coding loci, and a discussion of what the design and data can establish.
+## Introduction
 
-The primary comparison uses untreated organoids and organoids treated for 20 days, all harvested at day 80. The 10-day arm was harvested at day 70, which confounds its treatment comparison with harvest stage. The two lines come from a single donor.
+**How do APOE genotype and induced ageing affect the transcriptional state of human brain organoids, and does the response to treatment differ between the two APOE lines?**
+
+### Provided data
+
+- `counts.tsv` contains gene-level counts generated from STAR-aligned BAM files using GENCODE v49 annotation.
+- `RNAseq_challenge_metadata.csv` records the APOE genotype, treatment duration, harvest day, and biological replicate for each sample.
+- `multiqc_report.html` summarizes sequencing and alignment quality.
+
+### Experimental design
+
+The APOE4 line is the parental donor line. The APOE3 line is a CRISPR-edited isogenic line from the same donor. Each genotype-by-treatment group has three separate biological replicates of its respective line. Ageing was induced by inhibiting neddylation for 10 or 20 days. [Saurat et al., 2024](https://doi.org/10.1016/j.stem.2024.06.001)
+
+### Harvest-day confounding
+
+The 10-day treatment group was harvested on day 70. Untreated controls and 20-day-treated organoids were both harvested on day 80. Comparisons involving the 10-day arm and either of the other arms therefore combine treatment and harvest-day differences. The primary analysis compares 20 days of treatment with untreated controls at the matched day-80 harvest.
+
+### Software
+
+The analysis uses R 4.3.2, DESeq2 for differential expression, and KEGG for pathway enrichment. Package versions are documented in the report and its session information.
 
 ## Analysis workflow
 
