@@ -9,3 +9,5 @@ _cache/
 .RData
 .DS_Store
 /analysis.R
+/figures/*
+!/figures/README.md
