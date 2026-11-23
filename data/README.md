@@ -8,4 +8,3 @@ The three supplied challenge inputs are included under their original names.
 
 Add the human circAtlas 3.0 BED download as `human_bed_v3.0.txt` for the optional host-gene annotation. The catalogue is available from [circAtlas downloads](https://ngdc.cncb.ac.cn/circatlas/links1.php).
 
-The circAtlas catalogue is a separate download and is excluded from Git.
