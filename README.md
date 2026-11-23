@@ -4,6 +4,12 @@ Bulk RNA-seq analysis of how APOE line and neddylation inhibition relate to tran
 
 The primary comparison uses untreated organoids and organoids treated for 20 days, all harvested at day 80. The 10-day arm was harvested at day 70, which confounds its treatment comparison with harvest stage. The two lines come from a single donor.
 
+## Analysis workflow
+
+![Workflow from count and sample QC through DESeq2 contrasts, KEGG enrichment, and exploratory RNA annotation](assets/workflow.png)
+
+[Download the workflow PDF](assets/workflow.pdf)
+
 ## Run locally
 
 1. Place the original inputs and circAtlas annotation in [data/](data/README.md).
