@@ -1,8 +1,11 @@
 /data/*
-!/data/README.md
 /reference/
 /output/
 *.html
+!/data/README.md
+!/data/counts.tsv
+!/data/RNAseq_challenge_metadata.csv
+!/data/multiqc_report.html
 *_files/
 _cache/
 .Rhistory

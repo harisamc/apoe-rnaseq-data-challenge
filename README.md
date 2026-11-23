@@ -49,7 +49,7 @@ A separate exploratory edgeR analysis tested sample-inclusion sensitivity, ran c
 
 ## Run locally
 
-1. Place the original inputs and circAtlas annotation in [data/](data/README.md).
+1. The three challenge inputs are in [data/](data/README.md). Download the circAtlas annotation listed there to run the circRNA host-gene section.
 2. Use R 4.3 with Bioconductor packages DESeq2, apeglm, AnnotationDbi, org.Hs.eg.db, clusterProfiler, edgeR and genefilter. The report also uses rmarkdown, knitr, ggplot2, dplyr, pheatmap, RColorBrewer, ashr, ggrepel, patchwork and xml2.
 3. From the repository root, run:
 
@@ -63,4 +63,4 @@ Rendering requires Pandoc. A full render queries the KEGG API. For an offline ve
 Rscript -e 'rmarkdown::render("analysis.Rmd", output_format = "html_document", output_dir = "output", params = list(run_kegg = FALSE))'
 ```
 
-To extract the executable code for inspection, run `knitr::purl("analysis.Rmd")` in R. The R Markdown is the executable source of the report. For PDF, use `output_format = "pdf_document"` with a LaTeX installation. The source report is [analysis.Rmd](analysis.Rmd). The original submission is available locally in `reference/` when supplied. Raw inputs, rendered analyses and the original submission are kept local pending data-sharing permission.
+To extract the executable code for inspection, run `knitr::purl("analysis.Rmd")` in R. The R Markdown is the executable source of the report. For PDF, use `output_format = "pdf_document"` with a LaTeX installation. The source report is [analysis.Rmd](analysis.Rmd). The original submission is available locally in `reference/` when supplied. Rendered analyses and the original submission are kept local.
