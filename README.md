@@ -6,9 +6,28 @@ The primary comparison uses untreated organoids and organoids treated for 20 day
 
 ## Analysis workflow
 
+The diagram shows the original submission workflow.
+
 ![Workflow from count and sample QC through DESeq2 contrasts, KEGG enrichment, and exploratory RNA annotation](assets/workflow.png)
 
 [Download the workflow PDF](assets/workflow.pdf)
+
+### What the revision added
+
+- A MultiQC summary and rationale for retaining all 18 libraries, including the different roles of STAR genomic alignment and Salmon transcriptome quantification.
+- A [replicate-level ncRNA figure](figures/ncrna-replicate-responses.png) generated in the revised DESeq2 report. It shows the day-80 responses for PKN2-AS1, MIR124-2HG and DUBR using expression values from all three replicates per group.
+- A discussion of the day-70 harvest confounding, the single-donor design, and the limits of interpreting bulk expression and RNA annotations.
+
+See the [figure index](figures/README.md) for the PCA, sample-distance heatmap, volcano plots, and KEGG enrichment panels.
+
+## Next steps
+
+A separate exploratory edgeR analysis tested sample-inclusion sensitivity, ran complementary GO enrichment, and compared circRNA host annotations against an expression-adjusted background. Those checks sit outside the DESeq2 workflow in this repository.
+
+- **Check robustness within DESeq2.** Refit using only the day-80 libraries and check how much individual libraries influence the interaction. Obtain processing and sequencing batch details to investigate the shared STAR mapping pattern in APOE4 at day 20.
+- **Extend pathway and circRNA host analyses within DESeq2.** Compare directional KEGG enrichment with a complementary gene-set test. Compare circRNA host discoveries against the tested background while accounting for expression and, where possible, gene length and transcript complexity.
+- **Resolve individual RNA isoforms.** Obtain transcript-level quantifications for isoform expression or usage, and original sequencing reads for back-splice junction analysis of circular RNA.
+- **Check generalizability.** Repeat the matched-harvest experiment in additional donors and independently edited lines.
 
 ## Run locally
 
