@@ -1,6 +1,6 @@
 # APOE RNA-seq Data Challenge
 
-Bulk RNA-seq analysis of how APOE line and neddylation inhibition relate to transcription in human brain organoids. This repository is based on Harisa Muratovic-Colic’s original R Markdown, DESeq2 analysis, and KEGG interpretation. The portfolio revision adds explicit MultiQC interpretation, a replicate-level look at selected non-coding loci, and a discussion of what the design and data can establish.
+Bulk RNA-seq analysis of how APOE line and neddylation inhibition relate to transcription in human brain organoids. This repository covers a DESeq2 analysis, KEGG pathways analysis and descriptive RNA analysis. The portfolio revision adds explicit MultiQC interpretation, a replicate-level look at selected non-coding loci, and a discussion of what the design and data can establish.
 
 The primary comparison uses untreated organoids and organoids treated for 20 days, all harvested at day 80. The 10-day arm was harvested at day 70, which confounds its treatment comparison with harvest stage. The two lines come from a single donor.
 
