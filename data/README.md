@@ -6,5 +6,4 @@ The three supplied challenge inputs are included under their original names.
 - `RNAseq_challenge_metadata.csv` contains sample-level metadata.
 - `multiqc_report.html` contains sequencing and alignment QC.
 
-Add the human circAtlas 3.0 BED download as `human_bed_v3.0.txt` for the optional host-gene annotation. The catalogue is available from [circAtlas downloads](https://ngdc.cncb.ac.cn/circatlas/links1.php).
-
+`human_bed_v3.0.txt` is the human circAtlas 3.0 BED annotation used to identify known circRNA host genes. It was obtained from [circAtlas downloads](https://ngdc.cncb.ac.cn/circatlas/links1.php). [Wu et al., 2024](https://doi.org/10.1093/nar/gkad770)

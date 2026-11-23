@@ -6,6 +6,7 @@
 !/data/counts.tsv
 !/data/RNAseq_challenge_metadata.csv
 !/data/multiqc_report.html
+!/data/human_bed_v3.0.txt
 *_files/
 _cache/
 .Rhistory

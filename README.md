@@ -49,7 +49,7 @@ A separate exploratory edgeR analysis tested sample-inclusion sensitivity, ran c
 
 ## Run locally
 
-1. The three challenge inputs are in [data/](data/README.md). Download the circAtlas annotation listed there to run the circRNA host-gene section.
+1. The three challenge inputs and the circAtlas annotation are included in [data/](data/README.md).
 2. Use R 4.3 with Bioconductor packages DESeq2, apeglm, AnnotationDbi, org.Hs.eg.db, clusterProfiler, edgeR and genefilter. The report also uses rmarkdown, knitr, ggplot2, dplyr, pheatmap, RColorBrewer, ashr, ggrepel, patchwork and xml2.
 3. From the repository root, run:
 
