@@ -1,6 +1,6 @@
 /data/*
-/reference/*
-!/reference/data_challenge_HMC.pdf
+/report/*
+!/report/data_challenge_HMC.pdf
 /output/
 *.html
 !/data/README.md

@@ -1,6 +1,6 @@
 # APOE RNA-seq Data Challenge
 
-[Read the original challenge report (PDF)](reference/data_challenge_HMC.pdf)
+[Read the original challenge report (PDF)](report/data_challenge_HMC.pdf)
 
 ## Introduction
 
